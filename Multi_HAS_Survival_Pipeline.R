@@ -1,9 +1,9 @@
 # =============================================================================
 # Mixed-Effects Hierarchical Aware Stacking (ME-HAS) — Survival Pipeline
 # Script : Multi_HAS_Survival_Pipeline.R
-# Version: 9
-# Authors: Ibrar Hussain, Sohail Akhtar, Xinyi Cao, Shahzaib Rafiq,
-#          Can Liu, Yiqing Gu, Zaixiang Tang
+# Version: 10 (v9 run; reporting: ME-HAS main = 4 MICE methods)
+# Authors: Ibrar Hussain, Lichao Yang, Sohail Akhtar, Linkai Meil,
+#          Shahzaib Rafiq, Can Liu, Yiqing Gu, Zaixiang Tang
 # Affil. : Soochow University / University of Tabuk
 # =============================================================================
 #
@@ -12,39 +12,58 @@
 #   - Two missing-data mechanisms: MAR, MCAR
 #   - Five missingness proportions: 10%, 20%, 30%, 40%, 50%
 #   - S = 10 stratified random train/test splits per condition
-#   - Methods: Complete / MeanSI / KNN / RFI / MissInd /
+#   - MAIN (MAIN_HAS_VARIANT = "MM"):
+#     MICE-SE (competitor, Aleryani et al. 2020): MICE-PMM, m = 5; per-learner
+#       average over the 5 draws, free-weight meta-learner.
+#     ME-HAS (proposed): 4 MICE methods (pmm, cart, norm, rf) x 5 draws, draws
+#       averaged within learner x method (C=4 -> 16 streams);
+#       coxme lp + (lp|clf_id) + (1|method).
+#   - SUPPLEMENTARY: same-imputation comparison -- MICE-SE and ME-HAS both with
+#     PMM only, and both with the 4 methods (reporting labels: MICE_SE, ME_HAS_PMM,
+#     MICE_SE_MM, ME_HAS). Computation names: ME_HAS = PMM, ME_HAS_MM = 4-method.
+#   - Methods: Complete (paired, same split) / MeanSI / KNN / RFI / MissInd /
 #              MIE-PMM-Avg / MIE-CART-Avg / MICE-SE / ME-HAS
-#   - Metrics: Harrell C-index (primary), Uno's C-statistic (secondary)
-#   - Bonferroni correction: 28 combos × 2 metrics × 5 rates = 280 per mechanism
+#   - Metrics: Harrell C-index, Brier score (tau), integrated Brier score
+#   - Reporting: grand-mean tables + Kendall's W rank tables (irr::kendall)
 #
 # Design notes:
 #   - Unified seed formula guarantees identical train/test partitions across
 #     all methods within each experimental cell.
-#   - Between-imputation random intercept (imp_id BLUP) is intentionally
-#     excluded from test-set prediction; only the fixed slope and
-#     classifier-specific BLUP are applied (see Section 2.6 of the paper).
+#   - Imputation-method random intercept (method_id BLUP) is excluded from
+#     test-set prediction; only the fixed slope and classifier-specific
+#     slope BLUP are applied (it is a per-method constant: no effect on ranking).
 #   - Split-level .rds checkpoints allow resumption after interruptions.
-#   - MICE uses PMM with Nelson-Aalen cumulative hazard and event indicator
-#     as passive auxiliary predictors (White & Royston, 2009).
+#   - MICE (pmm/cart/norm/rf) uses the Nelson-Aalen cumulative hazard H0(T)
+#     and the event indicator as auxiliary predictors (White & Royston, 2009).
 #   - Missing Indicator: binary flag columns (_ind suffix) appended to
 #     mean-imputed data; falls back to MeanSI if the model fails.
 # =============================================================================
 
 # ── 0. Packages ───────────────────────────────────────────────────────────────
+# NOTE: pec aur flexsurv hata diye -- pipeline mein kahin use nahi hote the
+# (Uno's C / pec::cindex ab report nahi hota; Weibull AFT survival::survreg se hai).
 needed <- c("mice","VIM","missForest","survival","gbm",
-            "xgboost","coxme","pec","caret","dplyr","tidyr","ggplot2","purrr",
-            "readr","flexsurv","scales")
+            "coxme","caret","dplyr","tidyr","ggplot2","purrr",
+            "readr","scales",
+            "riskRegression","prodlim","ranger",  # ranger: mice "rf" method
+            "irr",                                 # irr: Kendall's W (kendall())
+            "rpart")                               # rpart: survival tree (weak learner)
 missing_pkgs <- needed[!needed %in% installed.packages()[,"Package"]]
 if (length(missing_pkgs) > 0) {
   message("Installing missing packages: ", paste(missing_pkgs, collapse=", "))
-  install.packages(missing_pkgs, repos="https://cloud.r-project.org")
+  # getOption("repos"): agar aap ne China mirror set kiya hai to wahi use hoga
+  repos <- getOption("repos")
+  if (is.null(repos) || identical(unname(repos["CRAN"]), "@CRAN@"))
+    repos <- "https://mirrors.tuna.tsinghua.edu.cn/CRAN/"
+  install.packages(missing_pkgs, repos=repos)
 }
 suppressPackageStartupMessages({
   library(mice); library(VIM); library(missForest)
-  library(survival); library(gbm); library(xgboost)
-  library(coxme); library(pec); library(flexsurv); library(caret)
+  library(survival); library(gbm)
+  library(coxme); library(caret)
   library(dplyr); library(tidyr); library(ggplot2)
   library(purrr); library(readr); library(scales)
+  library(riskRegression); library(prodlim); library(irr)
 })
 set.seed(2024)
 
@@ -53,25 +72,118 @@ N_SPLITS   <- 10
 MISS_RATES <- seq(0.10, 0.50, by=0.10)
 M_IMP      <- 5
 M_IMP_SE   <- 5
-MAXIT_MICE <- 20          # 20 Gibbs iterations for reliable convergence
+MAXIT_MICE <- 5           # mice default (5 iterations), binary MICE-GLMM-Stack pipeline jaisa
 CV_FOLDS   <- 5
 TRAIN_FRAC <- 0.70
-SURV_NAMES <- c("CoxPH", "GBM", "XGBoost", "WeibullAFT")
+# Base learners (4), har ek alag model family se:
+#   CoxPH      -- semi-parametric (linear effects)
+#   GBM        -- gradient-boosted trees (ensemble, Cox loss)
+#   SurvTree   -- single survival tree (rpart)
+#   WeibullAFT -- fully parametric (accelerated failure time)
+# (RSF aur CoxSpline ka code fit_surv() mein mojood hai lekin library mein shamil nahi.)
+LEARNER_SET <- "tree"   # output folder ke naam ke liye
+SURV_NAMES  <- c("CoxPH", "GBM", "SurvTree", "WeibullAFT")
 MISS_MECHS <- c("MAR", "MCAR")
 METHOD_ORDER <- c("Complete","MeanSI","KNN","RFI","MissInd",
                   "MIE_PMM_AVG","MIE_CART_AVG","MICE_SE","ME_HAS")
+# "All" classifier wale methods (sab classifiers ko combine karte hain)
+ALL_CLF_METHODS <- c("ME_HAS")
 
-# Bonferroni N computed dynamically after data loaded:
-# n_combos × n_metrics × n_rates  (per mechanism, separate tables)
-# Full run: 28 × 2 × 5 = 280 per mechanism
+# SUPPLEMENTARY: stacking methods ka multi-method (4 MICE methods) variant.
+# Yeh main tables / figures / Kendall ranks mein NAHI aate -- sirf alag
+# supplementary table mein (Multi_HAS_Survival_supp_multimethod_<mech>.tex/.csv).
+RUN_MULTIMETHOD <- TRUE
+SUPP_METHODS     <- c("MICE_SE_MM", "ME_HAS_MM")
+METHOD_ORDER_ALL <- c(METHOD_ORDER, if (RUN_MULTIMETHOD) SUPP_METHODS)
 
-RUN_ID         <- "v9"
+# ── MAIN paper ka ME-HAS variant ──
+# "MM"  = ME-HAS 4 MICE methods (pmm+cart+norm+rf) par -- MAIN paper (proposed method)
+# "PMM" = ME-HAS sirf MICE-PMM draws par
+# MICE_SE (competitor) MAIN mein hamesha Aleryani et al. (2020) jaisa sirf PMM hai.
+# NOTE: sirf REPORTING ke labels badalte hain. Computation aur checkpoints ke andar
+# naam wahi rehte hain (ME_HAS = PMM variant, ME_HAS_MM = 4-method variant), isliye
+# naya run zaroori nahi -- checkpoints se tables dobara ban jaati hain.
+# MAIN_HAS_VARIANT = "MM" par reporting labels:
+#   "ME_HAS"     = 4-method variant (main tables, figures, Kendall's W)
+#   "ME_HAS_PMM" = PMM-only variant (sirf supplementary table)
+MAIN_HAS_VARIANT <- "MM"
+if (MAIN_HAS_VARIANT == "MM" && !RUN_MULTIMETHOD)
+  stop("MAIN_HAS_VARIANT = 'MM' ke liye RUN_MULTIMETHOD = TRUE hona chahiye")
+REPORT_SUPP_METHODS <- if (MAIN_HAS_VARIANT == "MM") c("MICE_SE_MM", "ME_HAS_PMM") else SUPP_METHODS
+REPORT_LEVELS       <- c(METHOD_ORDER, if (RUN_MULTIMETHOD) REPORT_SUPP_METHODS)
+
+# ── 1b. ME-HAS meta-learner (coxme) ──────────────────────────────────────────
+# Model: lp (fixed common slope) + classifier random slope + imputation random
+# intercept:  Surv(time, event) ~ lp + (lp | clf_id) + (1 | method_id)
+# (code mein variable ka naam method_id hai: main mein = PMM draw, supp mein = MICE method)
+# coxme mein (lp | clf_id) SIRF random slope hai (intercept automatic add nahi hota).
+#   pmm  = predictive mean matching      cart = classification/regression trees
+#   norm = Bayesian linear regression    rf   = random-forest imputation
+# Sab MICE methods mein White & Royston (2009) auxiliaries: Nelson-Aalen H0(T) + event.
+# COMPUTATION mein dono variants chalte hain (neeche). Kaunsa variant MAIN paper
+# mein ME-HAS kehlata hai, yeh MAIN_HAS_VARIANT (section 1) decide karta hai.
+# Computation ka PMM variant (Aleryani et al. 2020 jaisa): ME-HAS aur MICE_SE dono
+#   MICE-PMM (m = 5) use karte hain.
+#   ME-HAS : streams = C learners x 5 PMM draws (C = 4 -> 20);
+#            coxme  lp + (lp | clf_id) + (1 | draw)
+#   MICE_SE: L0 = har classifier ki 5 PMM draws ki OOF/test predictions ka average
+# SUPPLEMENTARY (RUN_MULTIMETHOD = TRUE): ME_HAS_MM / MICE_SE_MM
+#   4 MICE methods (pmm, cart, norm, rf) x 5 draws; draws ka average per
+#   learner x method -> C x 4 streams (C = 4 -> 16); ME-HAS_MM: lp + (lp|clf_id) + (1|method)
+#   Dono stacking methods ke inputs (har variant ke andar) bilkul same hain.
+MICE_STACK_METHODS <- c("pmm", "cart", "norm", "rf")   # 4-method variant (MAIN ME-HAS)
+
+# Boundary (singular) fit ki definition.
+# coxme mein isSingular() nahi hai; coxme variance ko log scale par optimise
+# karta hai (theta = log(var), exp(pmax(-36, ...))), isliye variance kabhi
+# exactly 0 nahi hoti -- boundary par woh bohat chhota positive number deti hai.
+#   SINGULAR  : SD < 1e-4  -- bilkul lme4::isSingular(tol = 1e-4) jaisa (lme4
+#               yeh tolerance SD/theta par lagata hai) -> binary pipeline se consistent
+#   NEAR      : SD < 0.01  -- descriptive "near-boundary" (practically zero)
+SD_SINGULAR_TOL <- 1e-4
+SD_NEAR_TOL     <- 1e-2
+
+# ── 1c. Calibration / Brier settings ─────────────────────────────────────────
+# Har method sirf risk score deta hai (scales mukhtalif). Brier/calibration ke
+# liye S(t|x) chahiye, isliye TEST set par K-fold cross-fitted recalibration:
+#   har fold ke liye baaki (K-1) folds par coxph(Surv ~ score) + Breslow fit,
+#   phir is fold ke subjects ka S(t|x) predict (riskRegression::predictRisk).
+# Sab methods ke liye BILKUL same folds aur same tareeqa -- scale-free aur fair.
+CALIB_FOLDS   <- 5
+CALIB_SEED    <- 4242        # fold assignment ka seed (global RNG ko disturb nahi karta)
+CALIB_TAU_Q   <- 0.75        # tau = test event times ka 75th percentile
+# IBS grid: riskRegression IBS ko sirf diye gaye `times` par step function ki
+# tarah integrate karta hai (computePerformance.R: Dint(x=c(0,times), y=c(0,Brier)))
+# aur pehle interval [0, t1) ki value 0 leta hai. Isliye grid GHANA hona chahiye
+# aur t1 chhota -- warna IBS neeche ki taraf biased. 100 event-time quantiles (0..tau].
+CALIB_GRID_N  <- 100
+CALIB_METRICS <- c("Brier","IBS")
+
+# ── Evaluation metrics (sirf yeh teen) ──
+#   Cindex : Harrell C-index (survival::concordance)        -- zyada behtar
+#   Brier  : Brier score at tau (riskRegression::Score)     -- kam behtar
+#   IBS    : Integrated Brier score 0..tau (riskRegression) -- kam behtar
+EVAL_METRICS <- c("Cindex", "Brier", "IBS")
+METRIC_HIB   <- c(Cindex=TRUE, Brier=FALSE, IBS=FALSE)   # higher-is-better?
+METRIC_LABEL <- c(Cindex="Harrell C-index", Brier="Brier score", IBS="Integrated Brier score")
+
+# Naya folder: purane "v9" checkpoints mein ME-HAS ke results prediction-bug
+# wale hain (classifier slope ko intercept ki tarah joda gaya tha), isliye woh
+# dobara use NAHI hone chahiye.
+# v9_multimeth: ME-HAS ab 4 imputation methods (pmm/cart/norm/rf) use karta hai.
+# Naya folder, taa ke pichhle (sirf-PMM) run ke checkpoints load na hon.
+# v9_final: split-seed fix ke baad naya folder (purane checkpoints alag splits ke hain)
+RUN_ID         <- paste0("v9_final_", LEARNER_SET)
 OUTPUT_DIR     <- paste0("surv_HAS_", RUN_ID)
 CHECKPOINT_DIR <- file.path(OUTPUT_DIR, "checkpoints")
 DATA_DIR       <- file.path(path.expand("~"), "survival_data")
 DATA_DIR2      <- file.path(getwd(), "survival_data", "data")
 dir.create(OUTPUT_DIR,     recursive=TRUE, showWarnings=FALSE)
 dir.create(CHECKPOINT_DIR, recursive=TRUE, showWarnings=FALSE)
+# Har R session ki apni diagnostics file (parallel sessions ek doosre ki file
+# overwrite na karein). Summary saari "_part_*.csv" files ko jor kar banti hai.
+SESSION_TAG    <- paste0(format(Sys.time(), "%Y%m%d%H%M%S"), "_", Sys.getpid())
+META_DIAG_FILE <- file.path(OUTPUT_DIR, sprintf("Multi_HAS_Survival_mehas_diagnostics_part_%s.csv", SESSION_TAG))
 RESET_CHECKPOINTS <- FALSE
 if (RESET_CHECKPOINTS && dir.exists(CHECKPOINT_DIR)) {
   old_ckpts <- list.files(CHECKPOINT_DIR, pattern="\\.rds$", full.names=TRUE)
@@ -81,13 +193,23 @@ if (RESET_CHECKPOINTS && dir.exists(CHECKPOINT_DIR)) {
   }
 }
 
-# ── 2. Unified seed function ──────────────────────────────────────────────────
-# One seed formula for ALL splits (complete + missing).
-# Complete-case uses miss_rate=0 and mech="NONE" → offset=0.
-# This guarantees all methods see the exact same train/test partition.
+# ── 2. Seed functions ─────────────────────────────────────────────────────────
+# FIX: pehle train/test split ka seed miss_rate aur mech par bhi depend karta
+# tha, isliye har rate ka split ALAG tha aur 10% -> 50% trajectories mein split
+# ka noise mila hua tha (Complete ka C-index rate ke saath badalta tha).
+# Ab teen alag seeds:
+#   partition_seed: sirf (split, dataset) -- har rate aur mechanism par SAME
+#                   train/test split, taa ke rates ke beech comparison paired ho
+#   complete_seed : sirf (split, dataset) -- Complete ke model fits har rate par
+#                   bilkul same (GBM ki randomness bhi same)
+#   cell_seed     : (split, dataset, rate, mech) -- missingness mask aur MICE
+#                   imputations ke liye (har cell ka apna mask)
+ds_seed_offset <- function(ds_name) sum(utf8ToInt(ds_name))   # dataset-specific
+make_partition_seed <- function(sp, ds_name) 100000L + sp * 137L + ds_seed_offset(ds_name)
+make_complete_seed  <- function(sp, ds_name) 200000L + sp * 137L + ds_seed_offset(ds_name)
 make_split_seed <- function(sp, ds_name, miss_rate=0, mech="NONE") {
   mech_offset <- switch(mech, MAR=9999L, MCAR=19999L, 0L)
-  sp * 137L + as.integer(round(miss_rate * 1000)) + nchar(ds_name) + mech_offset
+  sp * 137L + as.integer(round(miss_rate * 1000)) + ds_seed_offset(ds_name) + mech_offset
 }
 
 # ── 3. Dataset Loaders ────────────────────────────────────────────────────────
@@ -97,7 +219,19 @@ make_surv_ds <- function(X_num, time, event) {
   df$event <- as.integer(event)
   df <- df[complete.cases(df[, c("time","event")]) & df$time > 0, ]
   pred_cols <- setdiff(names(df), c("time","event"))
-  df[, c(pred_cols[sapply(df[, pred_cols, drop=FALSE], is.numeric)], "time","event")]
+  df <- df[, c(pred_cols[sapply(df[, pred_cols, drop=FALSE], is.numeric)], "time","event")]
+  # FIX: kuch datasets (misal PBC) mein covariates mein PEHLE SE missing values
+  # hain. Benchmark ka design yeh hai ke missingness hum khud (known mechanism
+  # aur rate se) induce karein, isliye shuru complete data se hona chahiye.
+  # Warna: (1) actual missingness nominal se zyada (PBC: 57.6% vs 50%),
+  # (2) test set mein bhi NA -> un subjects ki predictions NA, aur
+  # (3) "Complete" method asal mein complete nahi hota.
+  n0 <- nrow(df)
+  df <- df[stats::complete.cases(df), , drop=FALSE]
+  if (nrow(df) < n0)
+    message(sprintf("  [DATA] %d rows with pre-existing missing covariates removed (complete cases: %d of %d)",
+                    n0 - nrow(df), nrow(df), n0))
+  df
 }
 load_csv <- function(filename) {
   candidates <- c(file.path(DATA_DIR, filename), file.path(DATA_DIR2, filename))
@@ -122,6 +256,25 @@ ALL_DATASETS <- list(
   list(name="HeartFailure", loader=function() load_csv("HeartFailure.csv"))
 )
 DATASET_REGISTRY <- ALL_DATASETS
+
+# ── Parallel run: datasets ko kai R sessions mein baanto ──
+# RUN_DATASETS <- NULL                       -> saare datasets (ya final "combine" run)
+# RUN_DATASETS <- c("WHAS500", "GBSG2")      -> sirf yeh datasets (ek session)
+# Har session same OUTPUT_DIR mein apne checkpoints likhta hai. Aakhir mein
+# RUN_DATASETS <- NULL ke saath ek dafa chalayein: saare datasets checkpoints se
+# load ho kar final tables / figures / Kendall ban jate hain (sirf kuch minute).
+RUN_DATASETS <- NULL
+# Terminal se bhi de sakte hain:  Rscript Multi_HAS_Survival_Pipeline.R WHAS500,GBSG2,PBC
+.cli_args <- commandArgs(trailingOnly = TRUE)
+if (length(.cli_args) > 0 && nzchar(.cli_args[1]))
+  RUN_DATASETS <- trimws(strsplit(.cli_args[1], ",")[[1]])
+if (!is.null(RUN_DATASETS)) {
+  bad <- setdiff(RUN_DATASETS, sapply(ALL_DATASETS, `[[`, "name"))
+  if (length(bad)) stop("Ghalat dataset naam: ", paste(bad, collapse=", "))
+  DATASET_REGISTRY <- Filter(function(d) d$name %in% RUN_DATASETS, ALL_DATASETS)
+  cat(sprintf(">>> Is session mein datasets: %s\n",
+              paste(sapply(DATASET_REGISTRY, `[[`, "name"), collapse=", ")))
+}
 
 # ── 4. Missing Data Injection ─────────────────────────────────────────────────
 induce_missing <- function(X, rate, mech="MAR",
@@ -209,7 +362,7 @@ impute_missind <- function(X_tr_miss, X_te_full=NULL) {
     mv <- mean(col, na.rm=TRUE); if (is.na(mv)) 0 else mv
   })
   missing_cols <- names(which(sapply(X_tr_miss, function(col) any(is.na(col)))))
-
+  
   add_indicators <- function(df, ref_missing_cols, col_means_vec, is_train) {
     # Fill missing values with training means
     for (nm in names(df)) {
@@ -230,7 +383,7 @@ impute_missind <- function(X_tr_miss, X_te_full=NULL) {
     }
     df
   }
-
+  
   # Train: build indicator BEFORE filling
   train_out <- as.data.frame(X_tr_miss)
   ind_flags <- lapply(missing_cols, function(nm) as.integer(is.na(train_out[[nm]])))
@@ -242,42 +395,65 @@ impute_missind <- function(X_tr_miss, X_te_full=NULL) {
   }
   # Append indicators
   for (nm in names(ind_flags)) train_out[[nm]] <- ind_flags[[nm]]
-
+  
   # Test: complete → all indicators 0
   test_out <- if (is.null(X_te_full)) NULL else {
     te <- as.data.frame(X_te_full)
     for (nm in paste0(missing_cols, "_ind")) te[[nm]] <- 0L
     te
   }
-
+  
   list(train=train_out, test=test_out,
        missing_cols=missing_cols, col_means=col_means)
 }
 
-mice_impute_surv <- function(X_miss, time_vec, event_vec,
-                             m=M_IMP, seed=1, maxit=MAXIT_MICE) {
-  n <- nrow(X_miss)
-  na_H <- tryCatch({
-    km_fit <- survival::survfit(survival::Surv(time_vec, event_vec) ~ 1, type="fh")
-    sapply(seq_len(n), function(i) {
-      ti <- time_vec[i]; if (is.na(ti) || ti <= 0) return(0)
-      idx <- which(km_fit$time <= ti); if (length(idx) == 0) return(0)
-      -log(max(km_fit$surv[max(idx)], 1e-9))
-    })
+# Nelson-Aalen cumulative hazard H0(T_i) har subject ke apne time par
+# (White & Royston 2009 ka recommended MICE auxiliary).
+# FIX: purana code survfit(type="fh") + -log(surv) use karta tha. type="fh"
+# partial-match se "fh2" (Efron tie-corrected) ban jata hai, aur -log(S) asal
+# Nelson-Aalen nahi. survfit() ka $cumhaz hamesha Nelson-Aalen (ctype=1) hai.
+nelson_aalen_at <- function(time_vec, event_vec) {
+  n <- length(time_vec)
+  tryCatch({
+    fit <- survival::survfit(survival::Surv(time_vec, event_vec) ~ 1)
+    H   <- stats::stepfun(fit$time, c(0, fit$cumhaz))
+    out <- H(time_vec); out[!is.finite(out)] <- 0; out
   }, error=function(e) rep(0, n))
-  df    <- data.frame(X_miss, .na_H=na_H, .time=time_vec, .event=event_vec)
-  meths <- setNames(rep("pmm", ncol(df)), names(df))
-  meths[c(".na_H",".time",".event")] <- ""
+}
+
+# MICE ke baad koi NA bach jaye (norm/rf mein collinearity wagaira) to
+# training mean se bharo -- binary pipeline ka fix_residual_nas() jaisa.
+fix_residual_nas <- function(df) {
+  for (nm in names(df)) if (any(is.na(df[[nm]]))) {
+    fv <- mean(df[[nm]], na.rm=TRUE); if (!is.finite(fv)) fv <- 0
+    df[[nm]][is.na(df[[nm]])] <- fv
+  }
+  df
+}
+
+# Ek hi MICE method (pmm/cart/norm/rf) se M imputations, survival auxiliaries ke saath
+mice_impute_surv_method <- function(X_miss, time_vec, event_vec, method,
+                                    m=M_IMP, seed=1, maxit=MAXIT_MICE) {
+  na_H  <- nelson_aalen_at(time_vec, event_vec)
+  df    <- data.frame(X_miss, .na_H=na_H, .event=event_vec)
+  meths <- setNames(rep(method, ncol(df)), names(df))
+  meths[c(".na_H",".event")] <- ""                 # auxiliaries complete hain
   for (nm in names(df)) if (!any(is.na(df[[nm]]))) meths[nm] <- ""
   pm <- mice::make.predictorMatrix(df)
-  pm[c(".na_H",".time",".event"), ] <- 0L
+  pm[c(".na_H",".event"), ] <- 0L                  # auxiliaries impute nahi hote
   suppressMessages(suppressWarnings(
     mids <- mice::mice(df, m=m, method=meths, predictorMatrix=pm,
                        seed=seed, printFlag=FALSE, maxit=maxit)
   ))
   X_cols <- names(X_miss)
-  lapply(seq_len(m), function(i) mice::complete(mids, i)[, X_cols, drop=FALSE])
+  lapply(seq_len(m), function(i)
+    fix_residual_nas(mice::complete(mids, i)[, X_cols, drop=FALSE]))
 }
+
+# Purane naam (MIE_PMM_AVG / MICE_SE ke liye) -- ab general function se
+mice_impute_surv <- function(X_miss, time_vec, event_vec,
+                             m=M_IMP, seed=1, maxit=MAXIT_MICE)
+  mice_impute_surv_method(X_miss, time_vec, event_vec, "pmm", m, seed, maxit)
 
 mice_impute_std <- function(X_miss, m=M_IMP, seed=1, maxit=MAXIT_MICE) {
   meths <- setNames(rep("pmm", ncol(X_miss)), names(X_miss))
@@ -291,35 +467,33 @@ mice_impute_std <- function(X_miss, m=M_IMP, seed=1, maxit=MAXIT_MICE) {
 
 mice_impute_cart <- function(X_miss, time_vec, event_vec,
                              m=M_IMP, seed=1, maxit=MAXIT_MICE) {
-  n <- nrow(X_miss)
-  na_H <- tryCatch({
-    km_fit <- survival::survfit(survival::Surv(time_vec, event_vec) ~ 1, type="fh")
-    sapply(seq_len(n), function(i) {
-      ti <- time_vec[i]; if (is.na(ti) || ti <= 0) return(0)
-      idx <- which(km_fit$time <= ti); if (length(idx) == 0) return(0)
-      -log(max(km_fit$surv[max(idx)], 1e-9))
-    })
-  }, error=function(e) rep(0, n))
-  df    <- data.frame(X_miss, .na_H=na_H, .time=time_vec, .event=event_vec)
-  meths <- setNames(rep("cart", ncol(df)), names(df))
-  meths[c(".na_H",".time",".event")] <- ""
-  for (nm in names(df)) if (!any(is.na(df[[nm]]))) meths[nm] <- ""
-  pm <- mice::make.predictorMatrix(df)
-  pm[c(".na_H",".time",".event"), ] <- 0L
-  mids <- tryCatch(
-    suppressMessages(suppressWarnings(
-      mice::mice(df, m=m, method=meths, predictorMatrix=pm,
-                 seed=seed, printFlag=FALSE, maxit=maxit))),
-    error=function(e) NULL)
-  if (is.null(mids)) {
-    message("  [CART fallback → PMM]")
-    return(mice_impute_surv(X_miss, time_vec, event_vec, m, seed, maxit))
-  }
-  X_cols <- names(X_miss)
-  lapply(seq_len(m), function(i) mice::complete(mids, i)[, X_cols, drop=FALSE])
+  tryCatch(mice_impute_surv_method(X_miss, time_vec, event_vec, "cart", m, seed, maxit),
+           error=function(e) {
+             message("  [CART fallback → PMM]")
+             mice_impute_surv(X_miss, time_vec, event_vec, m, seed, maxit)
+           })
 }
 
 # ── 6. Survival Model Wrapper ─────────────────────────────────────────────────
+# ── Learner failure log ──
+# Pehle learner errors chupke se NA ban jate the. Ab har error count hota hai,
+# har learner ke pehle 3 errors console mein print hote hain, aur end par
+# Multi_HAS_Survival_learner_failures.csv save hoti hai.
+.FIT_LOG <- new.env()
+.FIT_LOG$n   <- list()   # learner -> error count
+.FIT_LOG$fb  <- list()   # learner -> fallback count (CoxSpline -> linear)
+.FIT_LOG$msg <- list()   # learner -> pehle kuch error messages
+log_fit_event <- function(kind, learner, msg) {
+  cur <- .FIT_LOG[[kind]][[learner]]
+  .FIT_LOG[[kind]][[learner]] <- (if (is.null(cur)) 0 else cur) + 1
+  if (kind == "n") {
+    k <- .FIT_LOG$n[[learner]]
+    if (k <= 3) message(sprintf("  [LEARNER ERR] %s (#%d): %s", learner, k, msg))
+    if (length(.FIT_LOG$msg[[learner]]) < 10)
+      .FIT_LOG$msg[[learner]] <- c(.FIT_LOG$msg[[learner]], msg)
+  }
+}
+
 fit_surv <- function(model_name, X_tr, time_tr, event_tr, X_te) {
   p_names <- names(X_tr)
   df_tr   <- data.frame(X_tr, time=time_tr, event=event_tr)
@@ -335,23 +509,55 @@ fit_surv <- function(model_name, X_tr, time_tr, event_tr, X_te) {
                     n.trees=200, shrinkage=0.05, interaction.depth=3,
                     verbose=FALSE, bag.fraction=0.632)
       gbm::predict.gbm(m, newdata=df_te, n.trees=200)
-    } else if (model_name == "XGBoost") {
-      X_mat  <- as.matrix(X_tr[, p_names, drop=FALSE])
-      Xte_m  <- as.matrix(df_te[, p_names, drop=FALSE])
-      label  <- ifelse(event_tr==1, time_tr, -time_tr)
-      dtrain <- xgboost::xgb.DMatrix(data=X_mat, label=label)
-      dtest  <- xgboost::xgb.DMatrix(data=Xte_m)
-      params <- list(objective="survival:cox", eval_metric="cox-nloglik",
-                     eta=0.05, max_depth=3, subsample=0.632,
-                     colsample_bytree=0.8, lambda=1, alpha=0,
-                     min_child_weight=5, nthread=1)
-      m <- xgboost::xgb.train(params=params, data=dtrain, nrounds=200, verbose=0)
-      as.numeric(predict(m, dtest))
+    } else if (model_name == "CoxSpline") {
+      # Additive Cox model: har continuous predictor (>= 10 unique values) par
+      # penalised spline (survival::pspline, df = 3); baaki predictors linear.
+      # Non-linear effects pakadta hai jo CoxPH (linear) nahi pakadta.
+      terms <- vapply(p_names, function(v)
+        if (length(unique(df_tr[[v]])) >= 10) sprintf("pspline(%s, df = 3)", v) else v,
+        character(1))
+      f_sp <- as.formula(paste("Surv(time, event) ~", paste(terms, collapse = " + ")))
+      lp <- tryCatch({
+        m <- survival::coxph(f_sp, data=df_tr, ties="efron",
+                             control=coxph.control(iter.max=150, toler.inf=0.75))
+        out <- as.numeric(predict(m, newdata=df_te, type="lp"))
+        if (any(!is.finite(out))) stop("non-finite spline predictions")
+        out
+      }, error=function(e) NULL)
+      if (is.null(lp)) {
+        # Penalised spline fit fail -> linear CoxPH (fallback count hota hai,
+        # end par learner_failures CSV mein report)
+        log_fit_event("fb", "CoxSpline", "spline fit fail -> linear")
+        m  <- survival::coxph(f_surv, data=df_tr, ties="efron",
+                              control=coxph.control(iter.max=150, toler.inf=0.75))
+        lp <- predict(m, newdata=df_te, type="lp")
+      }
+      lp
+    } else if (model_name == "RSF") {
+      # Random survival forest (ranger, logrank split). Risk score = ensemble
+      # "mortality" = har subject ki cumulative hazard ka sum over unique death
+      # times (Ishwaran et al. 2008). Positive aur skewed hai -> log lete hain,
+      # taa ke baaki learners ki tarah log-hazard jaise scale par ho.
+      m <- ranger::ranger(f_surv, data=df_tr, num.trees=200, min.node.size=15,
+                          splitrule="logrank", num.threads=1, verbose=FALSE,
+                          seed=sample.int(.Machine$integer.max, 1))
+      chf <- predict(m, data=df_te)$chf
+      log(pmax(rowSums(chf), 1e-8))
+    } else if (model_name == "SurvTree") {
+      # Single survival tree (rpart, method="exp"; Therneau & Atkinson), standard settings.
+      # predict() estimated relative EVENT RATE deta hai (positive) -> log lete
+      # hain taa ke baaki learners ki tarah log-hazard scale par ho.
+      m <- rpart::rpart(f_surv, data=df_tr, method="exp",
+                        control=rpart::rpart.control(cp=0.01, minbucket=10, xval=0))
+      log(pmax(as.numeric(predict(m, newdata=df_te, type="vector")), 1e-8))
     } else if (model_name == "WeibullAFT") {
       m <- survival::survreg(f_surv, data=df_tr, dist="weibull")
       -predict(m, newdata=df_te, type="lp")
     } else rep(NA_real_, nrow(df_te))
-  }, error=function(e) rep(NA_real_, nrow(df_te))))
+  }, error=function(e) {
+    log_fit_event("n", model_name, conditionMessage(e))
+    rep(NA_real_, nrow(df_te))
+  }))
 }
 
 safe_fit_surv <- function(model_name, X_tr, time_tr, event_tr, X_te) {
@@ -371,39 +577,107 @@ compute_surv_metrics <- function(risk_scores, time_te, event_te,
                                  time_tr=NULL, event_tr=NULL) {
   risk_scores <- as.numeric(risk_scores)
   risk_scores[is.infinite(risk_scores)] <- NA_real_
-
+  
+  # Harrell's C: survival::concordance (Therneau). reverse=TRUE ka matlab:
+  # zyada risk score = kam survival time (concordant). Ties: survival ka default.
   cindex <- tryCatch(
     survival::concordance(
-      survival::Surv(time_te, event_te) ~ I(-risk_scores))$concordance,
+      survival::Surv(time_te, event_te) ~ risk_scores, reverse=TRUE)$concordance,
     error=function(e) NA_real_)
 
-  uno_c <- tryCatch({
-    ev_times <- time_te[event_te == 1L & !is.na(time_te)]
-    tau <- if (length(ev_times) >= 4L)
-      quantile(ev_times, 0.75, na.rm=TRUE)
-    else
-      quantile(time_te[!is.na(time_te)], 0.75, na.rm=TRUE)
-    if (!is.finite(tau) || tau <= 0) stop("invalid tau")
-    df_te <- data.frame(time=time_te, event=as.integer(event_te))
-    ci <- pec::cindex(
-      object     = list(Model=risk_scores),
-      formula    = Surv(time, event) ~ 1,
-      data       = df_te,
-      eval.times = tau,
-      verbose    = FALSE)
-    as.numeric(ci$AppCindex[["Model"]])
-  }, error=function(e) {
-    tryCatch({
-      ev_times <- time_te[event_te == 1L & !is.na(time_te)]
-      tau <- if (length(ev_times) >= 4L) quantile(ev_times, 0.75, na.rm=TRUE)
-      else quantile(time_te[!is.na(time_te)], 0.75, na.rm=TRUE)
-      survival::concordance(
-        survival::Surv(time_te, event_te) ~ I(-risk_scores),
-        timewt="n/G2", tau=tau)$concordance
-    }, error=function(e2) NA_real_)
-  })
+  calib <- tryCatch(compute_calib_metrics(risk_scores, time_te, event_te),
+                    error=function(e) {
+                      message(sprintf("  [CALIB WARN] %s", conditionMessage(e)))
+                      setNames(rep(NA_real_, length(CALIB_METRICS)), CALIB_METRICS)
+                    })
+  c(Cindex=as.numeric(cindex), calib)
+}
 
-  c(Cindex=as.numeric(cindex), Uno_C=as.numeric(uno_c))
+# ── 7b. Calibration & overall-accuracy metrics (library-based) ───────────────
+# Sab metrics established packages se:
+#   Brier(tau), IBS(0..tau) -> riskRegression::Score (IPCW, Kaplan-Meier censoring)
+#                              Graf et al. (1999); Gerds & Schumacher (2006)
+#
+# IMPORTANT (paper mein likhna hai): yeh RECALIBRATED performance hai -- score se
+# probability ka mapping test folds par cross-fit hota hai (sab methods ke liye
+# same folds). Brier/IBS overall accuracy (discrimination + calibration) naapte
+# hain, recalibration ke baad.
+
+# Local seed: fold assignment reproducible, lekin global RNG stream wahi rehti hai
+# (warna baaki methods ke results badal jate).
+with_local_seed <- function(seed, expr) {
+  had  <- exists(".Random.seed", envir=globalenv(), inherits=FALSE)
+  old  <- if (had) get(".Random.seed", envir=globalenv()) else NULL
+  on.exit({
+    if (had) assign(".Random.seed", old, envir=globalenv())
+    else if (exists(".Random.seed", envir=globalenv(), inherits=FALSE))
+      rm(".Random.seed", envir=globalenv())
+  })
+  set.seed(seed)
+  expr
+}
+
+# Test set ke folds -- sirf test data (time/event) par depend, method par NAHI,
+# isliye har method ko bilkul same folds milte hain.
+calib_folds <- function(time_te, event_te) {
+  seed <- CALIB_SEED + length(time_te) + sum(event_te) +
+    as.integer(round(sum(time_te) %% 1e5))
+  with_local_seed(seed,
+    caret::createFolds(factor(event_te), k=CALIB_FOLDS, list=TRUE, returnTrain=FALSE))
+}
+
+# Cross-fitted S(t|x): har fold ke liye baaki folds par coxph(score) + Breslow
+crossfit_event_prob <- function(risk, time_te, event_te, times) {
+  n    <- length(risk)
+  risk <- as.numeric(risk)
+  pmat <- matrix(NA_real_, n, length(times))
+  for (fi in calib_folds(time_te, event_te)) {
+    tri <- setdiff(seq_len(n), fi)
+    mu  <- mean(risk[tri], na.rm=TRUE); s <- sd(risk[tri], na.rm=TRUE)
+    if (!is.finite(s) || s < 1e-12) s <- 1
+    z   <- (risk - mu) / s
+    z[!is.finite(z)] <- 0              # NA score = average risk (z = 0)
+    d_tr <- data.frame(time=time_te[tri], event=event_te[tri], z=z[tri])
+    if (stats::sd(d_tr$z) < 1e-12) {
+      # Score constant hai (misal SurvTree ne koi split nahi banaya): score mein
+      # koi information nahi -> sab subjects ko Kaplan-Meier (null model) event
+      # probability -- "no prognostic information" ka sahi nateeja.
+      km <- survival::survfit(Surv(time, event) ~ 1, data=d_tr)
+      S  <- summary(km, times=times, extend=TRUE)$surv
+      pmat[fi, ] <- matrix(1 - S, nrow=length(fi), ncol=length(times), byrow=TRUE)
+      next
+    }
+    fit  <- survival::coxph(Surv(time, event) ~ z, data=d_tr, x=TRUE, y=TRUE, ties="breslow")  # riskRegression docs: x=TRUE, y=TRUE
+    pmat[fi, ] <- riskRegression::predictRisk(fit, newdata=data.frame(z=z[fi]),
+                                              times=times)
+  }
+  pmat   # event probability F(t|x) = 1 - S(t|x)
+}
+
+compute_calib_metrics <- function(risk_scores, time_te, event_te) {
+  ev  <- time_te[event_te == 1L & is.finite(time_te)]
+  if (length(ev) < 10L) stop("calibration ke liye kam az kam 10 events chahiye")
+  tau  <- as.numeric(stats::quantile(ev, CALIB_TAU_Q))
+  # Ghana grid: event times ke quantiles 0 se tau tak (tau khud aakhri point)
+  grid <- unique(as.numeric(stats::quantile(ev[ev <= tau],
+                                            seq(0, 1, length.out=CALIB_GRID_N))))
+  grid <- sort(unique(c(grid[grid > 0 & grid < tau], tau)))
+  stopifnot(abs(grid[length(grid)] - tau) < 1e-12)   # tau hamesha aakhri point
+
+  pmat <- crossfit_event_prob(risk_scores, time_te, event_te, grid)
+  df   <- data.frame(time=time_te, event=as.integer(event_te))
+
+  # Brier(tau) aur IBS(0..tau) -- riskRegression::Score (IPCW, KM censoring),
+  # cross-fitted probabilities par
+  sc <- riskRegression::Score(
+    list(Model=pmat), formula=Surv(time, event) ~ 1, data=df, times=grid,
+    metrics="brier", summary="ibs",
+    cens.model="km", null.model=FALSE, se.fit=FALSE, progress.bar=NULL)
+  br  <- as.data.frame(sc$Brier$score)
+  br  <- br[br$model == "Model" & abs(br$times - tau) < 1e-10, ]
+
+  c(Brier = if (nrow(br)) br$Brier[1] else NA_real_,
+    IBS   = if (nrow(br) && "IBS" %in% names(br)) br$IBS[1] else NA_real_)
 }
 
 # ── 8. MIE_PMM_AVG / MIE_CART_AVG ────────────────────────────────────────────
@@ -436,39 +710,42 @@ get_oof_surv <- function(surv_name, imp_tr, time_tr, event_tr, cv_folds=CV_FOLDS
 }
 
 # ── 10. ME-HAS Meta-Learner ───────────────────────────────────────────────────
-# The between-imputation random intercept (imp_id BLUP) is intentionally
-# excluded from test-set predictions.
+# Streams: har classifier c x imputation method k (pmm/cart/norm/rf) ka ek
+# stream = us method ke M draws ki predictions ka average.
 #
-# Reason: test_list[[clf]][, k] = model trained on imp_tr[[k]] applied to
-# X_te_full (complete, identical across k). The label "imp_id=k" on the test
-# side refers to which training imputation produced the model — it does NOT
-# correspond to a property of the test observations themselves. Applying the
-# training-estimated BLUP v_m to test rows whose imp label is only an
-# arbitrary index would introduce a spurious, direction-unknown adjustment.
-#
-# Practical impact: since var_intercept_imp << var_slope_clf (grand-mean
-# ratio 33:1), the re_imp values are near-zero and the fix has negligible
-# effect on C-index. Nevertheless, the corrected formula is theoretically
-# clean: only the fixed slope beta and the classifier BLUP u_c are used,
-# and averaging over c and m in Eq.(mehas_final) produces the final score.
+# Imputation-method random intercept v_k test prediction mein shamil NAHI:
+# test data complete hai (X_te_full); "method_id=k" sirf yeh batata hai ke
+# model kis training imputation method par train hua -- test subject ki koi
+# property nahi. Mathematical note: v_k har method ke liye ek constant hai;
+# har test subject ke paas sab K methods ki rows hain, isliye average ke baad
+# v_k ka hissa sab subjects ke liye same constant -- ranking (C-index)
+# par asar exactly zero.
+# Final score: mean over (c, k) of (beta + u_c) * lp_ick.
 
-run_has_surv <- function(oof_list, test_list, time_tr, event_tr) {
-  clfs  <- names(oof_list)
-  m     <- ncol(oof_list[[1]])
-  n_tr  <- length(time_tr)
-  n_te  <- nrow(test_list[[1]])
+# ── 10a. Long-format data  ─────────────────────
+# Har subject i, classifier c, draw m ke liye ek row: n x C x M rows.
+# lp har classifier ke andar training moments se standardise hota hai,
+# kyunke classifiers ke scales mukhtalif hain (log-HR, GBM score, log event rate,
+# -log time). Bina standardisation ke common slope beta ka koi matlab nahi.
+# oof_list[[clf]] / test_list[[clf]]: matrix, har column ek imputation METHOD
+# ka stream (us method ke M draws ka average). Column names = method names.
+build_has_long <- function(oof_list, test_list, time_tr, event_tr) {
+  clfs <- names(oof_list)
+  m    <- ncol(oof_list[[1]])
+  mlev <- if (!is.null(colnames(oof_list[[1]]))) colnames(oof_list[[1]]) else as.character(seq_len(m))
+  n_tr <- length(time_tr)
+  n_te <- nrow(test_list[[1]])
 
-  # ── Build long-format training data ──
   long_tr <- do.call(rbind, lapply(clfs, function(cl)
     do.call(rbind, lapply(seq_len(m), function(k)
       data.frame(lp     = oof_list[[cl]][, k],
                  time   = time_tr,
                  event  = event_tr,
                  obs_id = factor(seq_len(n_tr)),
-                 imp_id = factor(k),
+                 method_id = factor(mlev[k], levels=mlev),
                  clf_id = factor(cl, levels=clfs))))))
 
-  # ── Per-classifier normalisation (training moments) ──
+  # Per-classifier normalisation (sirf training moments)
   clf_norm <- setNames(lapply(clfs, function(cl) {
     vals <- long_tr$lp[long_tr$clf_id == cl]
     mu   <- mean(vals, na.rm=TRUE)
@@ -482,73 +759,132 @@ run_has_surv <- function(oof_list, test_list, time_tr, event_tr) {
   }
   long_tr$lp[!is.finite(long_tr$lp)] <- 0
 
-  # ── Fit coxme with fallback hierarchy ──
-  ok <- FALSE; mod <- NULL
-  for (frm in list(
-    Surv(time,event) ~ lp + (lp|clf_id) + (1|imp_id),
-    Surv(time,event) ~ lp + (1 |clf_id) + (1|imp_id),
-    Surv(time,event) ~ lp + (1 |clf_id)
-  )) {
-    if (ok) break
-    suppressMessages(suppressWarnings(tryCatch({
-      mod <- coxme::coxme(frm, data=long_tr); ok <- TRUE
-    }, error=function(e) NULL)))
-  }
 
-  # ── Build long-format test data ──
   long_te <- do.call(rbind, lapply(clfs, function(cl)
     do.call(rbind, lapply(seq_len(m), function(k)
       data.frame(
         lp      = (test_list[[cl]][, k] - clf_norm[[cl]]$mu) / clf_norm[[cl]]$s,
         obs_id  = factor(seq_len(n_te)),
-        imp_id  = factor(k),
+        method_id = factor(mlev[k], levels=mlev),
         clf_id  = factor(cl, levels=clfs),
         obs_int = seq_len(n_te))))))
   long_te$lp[!is.finite(long_te$lp)] <- 0
 
-  # ── Fallback: no coxme, use row-mean ──
+  list(long_tr=long_tr, long_te=long_te, clfs=clfs)
+}
+
+# ── 10b. Test-set prediction  ──────────────────
+# BUG FIX (purane code mein): classifier ka random effect u_c ek SLOPE hai
+# (lp | clf_id), lekin purana code usay  beta*lp + u_c  ki tarah intercept bana
+# kar jorta tha. Har test subject ke paas sab C x M rows hoti hain, isliye
+# average ke baad u_c ka hissa har subject ke liye ek hi constant ban jata tha,
+# aur ranking (C-index) par uska koi asar nahi tha. Natija: ME-HAS asal mein
+# sirf standardised lp ka simple average ban jata tha.
+# Sahi formula: (beta + u_c) * lp  -- yani har classifier ka apna weight.
+# Draw intercept v_m test prediction mein shamil nahi (paper Section 2.6).
+predict_has_long <- function(long_te, beta_lp, slope_clf) {
+  w_c <- beta_lp + slope_clf[as.character(long_te$clf_id)]
+  long_te$pred <- w_c * long_te$lp
+  long_te$pred[!is.finite(long_te$pred)] <- 0
+  agg <- aggregate(pred ~ obs_int, long_te, mean)
+  agg[order(agg$obs_int), "pred"]
+}
+
+# Fallback: model fail ho to standardised lp ka simple average
+fallback_has_pred <- function(long_te) {
+  agg <- aggregate(lp ~ obs_int, long_te, mean)
+  agg[order(agg$obs_int), "lp"]
+}
+
+EMPTY_VC <- list(var_slope_clf=NA_real_, var_intercept_imp=NA_real_)
+
+# ── 10c. ME-HAS diagnostics log ──────────────────────────────────────────────
+# Har fit ke foran baad CSV mein append hota hai (crash / resume ke baad bhi
+# poora record): kaunsa formula fit hua, beta, classifier weights, variance
+# components, aur kya variance boundary (singular) par thi.
+.META_ENV <- new.env()
+.META_ENV$cell    <- NA_character_
+.META_ENV$variant <- "PMM"
+log_meta_diag <- function(row) {
+  old <- if (file.exists(META_DIAG_FILE))
+    tryCatch(read.csv(META_DIAG_FILE, stringsAsFactors=FALSE), error=function(e) NULL)
+  new <- if (is.null(old)) row else dplyr::bind_rows(old, row)
+  write.csv(new, META_DIAG_FILE, row.names=FALSE)
+}
+
+# ── 10d. ME-HAS with coxme (bug fix ke saath) ─────────────────
+# coxme syntax: (lp | clf_id) SIRF random slope hai -- coxme mein intercept
+# automatic add nahi hota (coxme vignette). Fallback mein (1|clf_id) hata diya
+# kyunke standardisation ke baad woh by construction ~0 hota hai.
+run_has_surv_coxme <- function(oof_list, test_list, time_tr, event_tr) {
+  L <- build_has_long(oof_list, test_list, time_tr, event_tr)
+  long_tr <- L$long_tr; clfs <- L$clfs
+
+  ok <- FALSE; mod <- NULL; frm_used <- NULL
+  for (frm in list(
+    Surv(time,event) ~ lp + (lp | clf_id) + (1 | method_id),
+    Surv(time,event) ~ lp + (lp | clf_id),
+    Surv(time,event) ~ lp + (1  | method_id)
+  )) {
+    if (ok) break
+    suppressMessages(suppressWarnings(tryCatch({
+      mod <- coxme::coxme(frm, data=long_tr); ok <- TRUE; frm_used <- frm
+    }, error=function(e) NULL)))
+  }
   if (!ok) {
-    agg <- aggregate(lp ~ obs_int, long_te, mean)
-    return(list(pred    = agg[order(agg$obs_int), "lp"],
-                varcomp = list(var_slope_clf=NA_real_, var_intercept_imp=NA_real_)))
+    log_meta_diag(data.frame(Cell=.META_ENV$cell, Variant=.META_ENV$variant,
+                             n_rows=nrow(long_tr),
+                             formula="NONE (fallback simple mean)",
+                             stringsAsFactors=FALSE))
+    return(list(pred=fallback_has_pred(L$long_te), varcomp=EMPTY_VC,
+                fallback=TRUE, engine_used="fallback_mean"))
   }
 
-  # ── Extract fixed effect ──
   beta_lp <- tryCatch({
     fe <- coxme::fixef(mod)
     v  <- if ("lp" %in% names(fe)) fe["lp"] else fe[1]
-    if (is.finite(v)) v else 1
+    if (is.finite(v)) as.numeric(v) else 1
   }, error=function(e) 1)
 
-  # ── Extract random effects ──
   re <- tryCatch(coxme::ranef(mod), error=function(e) list())
-  get_re <- function(nm, levs) {
-    if (!nm %in% names(re)) return(setNames(rep(0, length(levs)), levs))
-    rv <- re[[nm]]
-    if (is.data.frame(rv))     rv <- rv[, 1, drop=TRUE]
-    else if (is.matrix(rv))    rv <- rv[, 1]
-    else                       rv <- unlist(rv)
-    vals <- setNames(rep(0, length(levs)), levs)
-    common <- intersect(names(rv), levs)
-    vals[common] <- rv[common]
-    vals
+  slope_clf <- setNames(rep(0, length(clfs)), clfs)
+  if ("clf_id" %in% names(re)) {
+    rv <- re[["clf_id"]]
+    if (is.data.frame(rv) || is.matrix(rv)) {
+      nm <- rownames(rv); rv <- rv[, 1]; names(rv) <- nm
+    } else rv <- unlist(rv)
+    common <- intersect(names(rv), clfs)
+    slope_clf[common] <- rv[common]
   }
-  re_clf <- get_re("clf_id", clfs)
-  # re_imp (v_m) is intentionally excluded from test-set prediction;
-  # only the fixed slope (beta) and classifier BLUP (u_c) are applied.
 
-  # ── Test-set prediction: beta*lp + u_c only ──
-  # v_m is dropped for test observations: averaging over M imputations
-  # is equivalent to marginalising over the between-imputation random effect.
-  long_te$pred <- beta_lp * long_te$lp +
-    re_clf[as.character(long_te$clf_id)]
-  long_te$pred[!is.finite(long_te$pred)] <- 0
+  vc      <- extract_coxme_varcomp(mod)
+  frm_txt <- paste(deparse(frm_used), collapse="")
+  # Kaunsa formula fit hua -- full model ke ilawa koi bhi formula reduced model
+  # hai aur paper mein report hona chahiye.
+  log_meta_diag(data.frame(
+    Cell = .META_ENV$cell, Variant = .META_ENV$variant, n_rows = nrow(long_tr),
+    formula = frm_txt,
+    full_model = grepl("clf_id", frm_txt) && grepl("method_id", frm_txt),
+    n_methods = nlevels(long_tr$method_id),
+    methods = paste(levels(long_tr$method_id), collapse="+"),
+    beta = beta_lp,
+    t(setNames(beta_lp + slope_clf, paste0("w_", names(slope_clf)))),
+    var_slope_clf = vc$var_slope_clf, var_intercept_method = vc$var_intercept_imp,
+    sd_slope_clf        = sqrt(vc$var_slope_clf),
+    sd_intercept_method = sqrt(vc$var_intercept_imp),
+    singular_clf    = isTRUE(sqrt(vc$var_slope_clf)     < SD_SINGULAR_TOL),
+    singular_method = isTRUE(sqrt(vc$var_intercept_imp) < SD_SINGULAR_TOL),
+    near_clf        = isTRUE(sqrt(vc$var_slope_clf)     < SD_NEAR_TOL),
+    near_method     = isTRUE(sqrt(vc$var_intercept_imp) < SD_NEAR_TOL),
+    stringsAsFactors = FALSE, row.names = NULL))
 
-  agg      <- aggregate(pred ~ obs_int, long_te, mean)
-  pred_vec <- agg[order(agg$obs_int), "pred"]
+  list(pred    = predict_has_long(L$long_te, beta_lp, slope_clf),
+       varcomp = vc, fallback = FALSE, engine_used = frm_txt)
+}
 
-  varcomp <- extract_coxme_varcomp(mod)
-  list(pred=pred_vec, varcomp=varcomp)
+# ── 10e. ME-HAS entry point ──────────────────────────────────────────────────
+run_has_surv <- function(oof_list, test_list, time_tr, event_tr) {
+  run_has_surv_coxme(oof_list, test_list, time_tr, event_tr)
 }
 
 extract_coxme_varcomp <- function(mod) {
@@ -563,8 +899,10 @@ extract_coxme_varcomp <- function(mod) {
     if (is.numeric(m) && length(m)>=1)             return(as.numeric(m[1]))
     NA_real_
   }
+  # var_intercept_imp column naam purana rakha (tables/CSV ke liye), lekin
+  # ab yeh imputation METHOD (pmm/cart/norm/rf) ke random intercept ki variance hai
   list(var_slope_clf    = get_var("clf_id"),
-       var_intercept_imp = get_var("imp_id"))
+       var_intercept_imp = get_var("method_id"))
 }
 
 # ── 11. MICE_SE ───────────────────────────────────────────────────────────────
@@ -574,12 +912,12 @@ mice_se_l0_surv <- function(imp_tr, time_tr, event_tr, imp_te,
   n_tr  <- length(time_tr); n_te <- nrow(imp_te[[1]])
   k_use <- min(oof_folds, n_tr)
   folds <- caret::createFolds(event_tr, k=k_use, list=TRUE, returnTrain=FALSE)
-
+  
   L0_tr_sum <- matrix(0,  n_tr, length(SURV_NAMES), dimnames=list(NULL, SURV_NAMES))
   L0_te_sum <- matrix(0,  n_te, length(SURV_NAMES), dimnames=list(NULL, SURV_NAMES))
   L0_tr_cnt <- matrix(0L, n_tr, length(SURV_NAMES), dimnames=list(NULL, SURV_NAMES))
   L0_te_cnt <- matrix(0L, n_te, length(SURV_NAMES), dimnames=list(NULL, SURV_NAMES))
-
+  
   for (sn in SURV_NAMES)
     for (k in seq_len(m_use)) {
       oof_k <- rep(NA_real_, n_tr)
@@ -595,7 +933,7 @@ mice_se_l0_surv <- function(imp_tr, time_tr, event_tr, imp_te,
       v_tr <- !is.na(oof_k) & is.finite(oof_k)
       L0_tr_sum[v_tr, sn] <- L0_tr_sum[v_tr, sn] + oof_k[v_tr]
       L0_tr_cnt[v_tr, sn] <- L0_tr_cnt[v_tr, sn] + 1L
-
+      
       te_k <- tryCatch(
         safe_fit_surv(sn, imp_tr[[k]], time_tr, event_tr, imp_te[[k]]),
         error=function(e) rep(NA_real_, n_te))
@@ -603,13 +941,23 @@ mice_se_l0_surv <- function(imp_tr, time_tr, event_tr, imp_te,
       L0_te_sum[v_te, sn] <- L0_te_sum[v_te, sn] + te_k[v_te]
       L0_te_cnt[v_te, sn] <- L0_te_cnt[v_te, sn] + 1L
     }
-
+  
   L0_tr <- ifelse(L0_tr_cnt > 0L, L0_tr_sum / L0_tr_cnt, 0)
   L0_te <- ifelse(L0_te_cnt > 0L, L0_te_sum / L0_te_cnt, 0)
   list(L0_tr=L0_tr, L0_te=L0_te)
 }
 
 run_mice_se_surv <- function(L0_tr, L0_te, time_tr, event_tr, meta_surv) {
+  # FAIRNESS FIX: ME-HAS ki tarah har column (classifier) ko TRAINING moments
+  # se standardise karo (test par wahi mu/s). Classifiers ke scales mukhtalif
+  # hain; bina standardisation ke coxph meta-learner ki convergence kharab hoti
+  # hai aur woh zyada fallback par jata hai. Fallback (rowMeans) raw scale par hi.
+  L0_tr_raw <- L0_tr; L0_te_raw <- L0_te
+  mu <- colMeans(L0_tr, na.rm=TRUE)
+  sg <- apply(L0_tr, 2, sd, na.rm=TRUE)
+  sg[!is.finite(sg) | sg < 1e-8] <- 1
+  L0_tr <- sweep(sweep(as.matrix(L0_tr), 2, mu, "-"), 2, sg, "/")
+  L0_te <- sweep(sweep(as.matrix(L0_te), 2, mu, "-"), 2, sg, "/")
   df_tr <- as.data.frame(L0_tr); df_te <- as.data.frame(L0_te)
   df_tr$time <- time_tr; df_tr$event <- event_tr
   lp_terms <- paste(names(as.data.frame(L0_tr)), collapse=" + ")
@@ -623,25 +971,40 @@ run_mice_se_surv <- function(L0_tr, L0_te, time_tr, event_tr, meta_surv) {
       safe_fit_surv(meta_surv, as.data.frame(L0_tr), time_tr, event_tr,
                     as.data.frame(L0_te))
     }
-  }, error=function(e) rowMeans(L0_te, na.rm=TRUE))
+  }, error=function(e) rowMeans(L0_te_raw, na.rm=TRUE))
 }
 
 # ── 12. Single Run ────────────────────────────────────────────────────────────
 run_one_surv <- function(miss_mech, miss_rate, split_seed,
                          X_tr_full, time_tr, event_tr,
-                         X_te_full, time_te, event_te) {
+                         X_te_full, time_te, event_te,
+                         X_tr_miss = NULL, complete_seed = NULL) {
   rows <- list()
-
+  
   rec <- function(method, surv_name, pred) {
     mt <- compute_surv_metrics(pred, time_te, event_te)
     data.frame(Method=method, Classifier=surv_name, t(mt), stringsAsFactors=FALSE)
   }
+  
+  # ── Complete (PAIRED reference): bilkul isi train/test split par, poora data ──
+  # Pehle Complete alag split (miss_rate=0 seed) par chalta tha, isliye missing
+  # cells ke saath paired comparison nahi tha. Ab har cell mein same split.
+  # complete_seed: har rate par same Complete fits (GBM ki randomness bhi).
+  # Uske baad cell_seed se RNG dobara set -- baaki methods cell-specific rehte hain.
+  if (!is.null(complete_seed)) set.seed(complete_seed)
+  for (sn in SURV_NAMES)
+    rows[[length(rows)+1]] <- rec("Complete", sn,
+      safe_fit_surv(sn, X_tr_full, time_tr, event_tr, X_te_full))
+  set.seed(split_seed + 7L)
 
-  X_tr_miss <- tryCatch(
-    induce_missing(X_tr_full, miss_rate, miss_mech,
-                   time_vec=time_tr, event_vec=event_tr),
-    error=function(e) X_tr_full)
-
+  # Missingness mask main loop mein EK dafa banta hai aur yahan pass hota hai,
+  # taa ke log ki gayi actual missingness wahi ho jis par sab methods chalte hain.
+  if (is.null(X_tr_miss))
+    X_tr_miss <- tryCatch(
+      induce_missing(X_tr_full, miss_rate, miss_mech,
+                     time_vec=time_tr, event_vec=event_tr),
+      error=function(e) X_tr_full)
+  
   # ── Single-imputation baselines ──
   fb <- list()
   si_mean <- impute_mean(X_tr_miss, X_te_full)
@@ -661,7 +1024,7 @@ run_one_surv <- function(miss_mech, miss_rate, split_seed,
       message(sprintf("  [FALLBACK] RFI → MeanSI: %s", conditionMessage(e)))
       impute_mean(X_tr_miss, X_te_full)
     })
-
+  
   # ── Missing Indicator ──
   fb$missind <- FALSE
   si_missind <- tryCatch(
@@ -671,7 +1034,7 @@ run_one_surv <- function(miss_mech, miss_rate, split_seed,
       message(sprintf("  [FALLBACK] MissInd → MeanSI: %s", conditionMessage(e)))
       impute_mean(X_tr_miss, X_te_full)
     })
-
+  
   for (sn in SURV_NAMES) {
     rows[[length(rows)+1]] <- rec("MeanSI", sn,
                                   safe_fit_surv(sn, si_mean$train,   time_tr, event_tr, si_mean$test))
@@ -685,7 +1048,7 @@ run_one_surv <- function(miss_mech, miss_rate, split_seed,
     rows[[length(rows)+1]] <- rec("MissInd", sn,
                                   safe_fit_surv(sn, si_missind$train, time_tr, event_tr, si_missind$test))
   }
-
+  
   # ── MICE PMM + ME-HAS OOF ──
   fb$mice_na <- FALSE
   imp_tr <- tryCatch(
@@ -696,7 +1059,7 @@ run_one_surv <- function(miss_mech, miss_rate, split_seed,
       mice_impute_std(X_tr_miss, M_IMP, split_seed, MAXIT_MICE)
     })
   imp_te <- lapply(seq_len(M_IMP), function(i) X_te_full)
-
+  
   oof_list <- list(); test_list <- list()
   for (sn in SURV_NAMES) {
     oof_list[[sn]] <- tryCatch(
@@ -706,7 +1069,7 @@ run_one_surv <- function(miss_mech, miss_rate, split_seed,
     rows[[length(rows)+1]] <- rec("MIE_PMM_AVG", sn, res$risk)
     test_list[[sn]] <- res$risk_mat
   }
-
+  
   # ── MIE CART AVG ──
   fb$mice_cart  <- FALSE
   imp_tr_cart   <- tryCatch(
@@ -721,52 +1084,135 @@ run_one_surv <- function(miss_mech, miss_rate, split_seed,
     res_cart <- run_mie_avg_surv(sn, imp_tr_cart, time_tr, event_tr, imp_te_cart)
     rows[[length(rows)+1]] <- rec("MIE_CART_AVG", sn, res_cart$risk)
   }
-
-  # ── MICE_SE ──
-  fb$mice_se_imp <- FALSE
-  imp_tr_se <- tryCatch(
-    mice_impute_surv(X_tr_miss, time_tr, event_tr, M_IMP_SE, split_seed+1L, MAXIT_MICE),
-    error=function(e) {
-      fb$mice_se_imp <<- TRUE
-      message(sprintf("  [FALLBACK] MICE_SE imp → reuse imp_tr: %s", conditionMessage(e)))
-      imp_tr
-    })
-  imp_te_se  <- lapply(seq_len(M_IMP_SE), function(i) X_te_full)
-  fb$mice_se_l0 <- FALSE
-  l0 <- tryCatch(
-    mice_se_l0_surv(imp_tr_se, time_tr, event_tr, imp_te_se),
-    error=function(e) {
-      fb$mice_se_l0 <<- TRUE
-      message(sprintf("  [FALLBACK] MICE_SE L0 → rowMeans: %s", conditionMessage(e)))
-      NULL
-    })
-  for (meta_sn in SURV_NAMES) {
-    risk_se <- if (!is.null(l0)) {
-      tryCatch(run_mice_se_surv(l0$L0_tr, l0$L0_te, time_tr, event_tr, meta_sn),
-               error=function(e) rowMeans(l0$L0_te, na.rm=TRUE))
-    } else {
-      rowMeans(do.call(cbind, lapply(seq_len(M_IMP_SE), function(k)
-        safe_fit_surv(meta_sn, imp_tr_se[[k]], time_tr, event_tr, X_te_full))),
-        na.rm=TRUE)
+  
+  # ════════════════════════════════════════════════════════════════════════
+  # STACKING METHODS (MICE_SE aur ME-HAS)
+  # ════════════════════════════════════════════════════════════════════════
+  # Helper: invalid streams (>10% non-finite, kisi bhi classifier mein) hatao,
+  # taa ke har classifier ke paas same streams hon aur koi stream chupke se 0 na bane.
+  clean_streams <- function(so, st, tag) {
+    ok <- Reduce(intersect, lapply(SURV_NAMES, function(sn)
+      colnames(so[[sn]])[colMeans(is.finite(so[[sn]])) >= 0.9 &
+                         colMeans(is.finite(st[[sn]])) >= 0.9]))
+    if (length(ok) == 0) {
+      fr <- sapply(SURV_NAMES, function(sn)
+        round(pmin(colMeans(is.finite(so[[sn]])), colMeans(is.finite(st[[sn]]))), 2))
+      stop(sprintf("[%s] koi stream valid nahi; finite fraction: %s", tag,
+                   paste(capture.output(print(fr)), collapse=" | ")))
     }
-    rows[[length(rows)+1]] <- rec("MICE_SE", meta_sn, risk_se)
+    if (length(ok) < ncol(so[[1]]))
+      message(sprintf("  [STACK %s] streams hataye: %s", tag,
+                      paste(setdiff(colnames(so[[1]]), ok), collapse=",")))
+    list(oof = lapply(so, function(m) m[, ok, drop=FALSE]),
+         te  = lapply(st, function(m) m[, ok, drop=FALSE]))
   }
 
-  # ── ME-HAS ──
-  fb$me_has  <- FALSE
-  mehas_t0   <- proc.time()
-  has_out <- tryCatch(
-    run_has_surv(oof_list, test_list, time_tr, event_tr),
-    error=function(e) {
-      fb$me_has <<- TRUE
-      message(sprintf("  [FALLBACK] ME_HAS → rowMeans: %s", conditionMessage(e)))
-      list(pred    = rowMeans(do.call(cbind, lapply(test_list, rowMeans, na.rm=TRUE))),
-           varcomp = list(var_slope_clf=NA_real_, var_intercept_imp=NA_real_))
+  # Helper: MICE_SE (Aleryani et al. 2020): har classifier ka L0 = us ke saare
+  # streams (imputations) ka average; phir free-weight meta-learner (har learner).
+  run_se_variant <- function(S, label) {
+    l0 <- tryCatch({
+      L0_tr <- sapply(SURV_NAMES, function(sn) rowMeans(S$oof[[sn]], na.rm=TRUE))
+      L0_te <- sapply(SURV_NAMES, function(sn) rowMeans(S$te[[sn]],  na.rm=TRUE))
+      L0_tr <- matrix(L0_tr, ncol=length(SURV_NAMES), dimnames=list(NULL, SURV_NAMES))
+      L0_te <- matrix(L0_te, ncol=length(SURV_NAMES), dimnames=list(NULL, SURV_NAMES))
+      L0_tr[!is.finite(L0_tr)] <- 0; L0_te[!is.finite(L0_te)] <- 0
+      list(L0_tr=L0_tr, L0_te=L0_te)
+    }, error=function(e) {
+      message(sprintf("  [FALLBACK] %s L0 fail: %s", label, conditionMessage(e)))
+      NULL
     })
-  mehas_elapsed <- (proc.time() - mehas_t0)[["elapsed"]]
-  rows[[length(rows)+1]] <- rec("ME_HAS", "All", has_out$pred)
-  me_has_vc <- has_out$varcomp
+    for (meta_sn in SURV_NAMES) {
+      risk_se <- if (!is.null(l0)) {
+        tryCatch(run_mice_se_surv(l0$L0_tr, l0$L0_te, time_tr, event_tr, meta_sn),
+                 error=function(e) rowMeans(l0$L0_te, na.rm=TRUE))
+      } else rowMeans(do.call(cbind, lapply(S$te, rowMeans, na.rm=TRUE)), na.rm=TRUE)
+      rows[[length(rows)+1]] <<- rec(label, meta_sn, risk_se)
+    }
+    is.null(l0)   # TRUE = fallback
+  }
 
+  # Helper: ME-HAS (coxme) ek variant par; fallback flag ke saath
+  run_has_variant <- function(S, label) {
+    out <- tryCatch(
+      run_has_surv(S$oof, S$te, time_tr, event_tr),
+      error=function(e) {
+        message(sprintf("  [FALLBACK] %s → rowMeans: %s", label, conditionMessage(e)))
+        list(pred     = rowMeans(do.call(cbind, lapply(S$te, rowMeans, na.rm=TRUE))),
+             varcomp  = list(var_slope_clf=NA_real_, var_intercept_imp=NA_real_),
+             fallback = TRUE)
+      })
+    if (isTRUE(out$fallback))
+      message(sprintf("  [FALLBACK] %s model fit fail -> standardised simple mean", label))
+    rows[[length(rows)+1]] <<- rec(label, "All", out$pred)
+    out
+  }
+
+  # ── (A) sirf MICE-PMM (Aleryani jaisa): MICE_SE = MAIN competitor; ME_HAS (PMM) ──
+  #     MAIN_HAS_VARIANT = "MM" par yeh ME-HAS sirf supplementary mein ('ME_HAS_PMM')
+  # Streams = classifier x PMM draw (draws ka average NAHI); same PMM
+  # imputations aur OOF/test predictions jo MIE_PMM_AVG use karta hai.
+  mehas_t0 <- proc.time()
+  name_draws <- function(m) { colnames(m) <- paste0("pmm_d", seq_len(ncol(m))); m }
+  S_pmm <- clean_streams(lapply(oof_list, name_draws), lapply(test_list, name_draws), "PMM")
+
+  fb$mice_se_imp <- FALSE
+  fb$mice_se_l0  <- run_se_variant(S_pmm, "MICE_SE")
+
+  .META_ENV$variant <- "PMM"
+  has_out <- run_has_variant(S_pmm, "ME_HAS")
+  fb$me_has <- isTRUE(has_out$fallback)
+  mehas_elapsed <- (proc.time() - mehas_t0)[["elapsed"]]
+
+  # ── (B) 4 MICE methods (pmm, cart, norm, rf) -- MAIN ME-HAS jab MAIN_HAS_VARIANT = "MM";
+  #     MICE_SE_MM sirf supplementary (same-imputation comparison) ──
+  fb$me_has_mm <- NA
+  if (RUN_MULTIMETHOD) {
+    stack_imp <- list()
+    for (mi in seq_along(MICE_STACK_METHODS)) {
+      meth <- MICE_STACK_METHODS[mi]
+      stack_imp[[meth]] <- if (meth == "pmm" && !isTRUE(fb$mice_na)) imp_tr
+        else if (meth == "cart" && !isTRUE(fb$mice_cart)) imp_tr_cart
+        else tryCatch(
+          mice_impute_surv_method(X_tr_miss, time_tr, event_tr, meth,
+                                  M_IMP, split_seed + 10L*mi, MAXIT_MICE),
+          error=function(e) {
+            message(sprintf("  [STACK MM] method '%s' imputation fail, chhoda: %s",
+                            meth, conditionMessage(e)))
+            NULL
+          })
+    }
+    stack_imp <- Filter(Negate(is.null), stack_imp)
+    if (length(stack_imp) > 0) {
+      so <- list(); st <- list()
+      for (sn in SURV_NAMES) {
+        oc <- list(); tc <- list()
+        for (meth in names(stack_imp)) {
+          imps  <- stack_imp[[meth]]
+          reuse <- meth == "pmm" && identical(imps, imp_tr)
+          oof_m <- if (reuse) oof_list[[sn]] else
+            tryCatch(get_oof_surv(sn, imps, time_tr, event_tr),
+                     error=function(e) matrix(NA_real_, length(time_tr), length(imps)))
+          te_m  <- if (reuse) test_list[[sn]] else
+            run_mie_avg_surv(sn, imps, time_tr, event_tr,
+                             lapply(seq_along(imps), function(i) X_te_full))$risk_mat
+          oc[[meth]] <- rowMeans(oof_m, na.rm=TRUE)   # draws ka average per method
+          tc[[meth]] <- rowMeans(te_m,  na.rm=TRUE)
+        }
+        so[[sn]] <- do.call(cbind, oc); st[[sn]] <- do.call(cbind, tc)
+      }
+      S_mm <- tryCatch(clean_streams(so, st, "MM"), error=function(e) {
+        message(conditionMessage(e)); NULL })
+      if (!is.null(S_mm)) {
+        run_se_variant(S_mm, "MICE_SE_MM")
+        .META_ENV$variant <- "MM"
+        has_mm <- run_has_variant(S_mm, "ME_HAS_MM")
+        fb$me_has_mm <- isTRUE(has_mm$fallback)
+      }
+    }
+  }
+
+  me_has_vc <- has_out$varcomp
+  
   # ── Variance decomposition rows ──
   var_rows <- do.call(rbind, lapply(SURV_NAMES, function(sn) {
     mat <- oof_list[[sn]]
@@ -783,7 +1229,7 @@ run_one_surv <- function(miss_mech, miss_rate, split_seed,
     var_slope_clf    = me_has_vc$var_slope_clf,
     var_intercept_imp = me_has_vc$var_intercept_imp,
     stringsAsFactors=FALSE))
-
+  
   fb_row <- data.frame(
     MissMech       = miss_mech,
     MissRate       = miss_rate,
@@ -795,8 +1241,9 @@ run_one_surv <- function(miss_mech, miss_rate, split_seed,
     fb_mice_se_imp = fb$mice_se_imp,
     fb_mice_se_l0  = fb$mice_se_l0,
     fb_me_has      = fb$me_has,
+    fb_me_has_mm   = fb$me_has_mm,
     stringsAsFactors=FALSE)
-
+  
   list(rows=do.call(rbind, rows), var_rows=var_rows,
        fb_row=fb_row, mehas_elapsed=mehas_elapsed)
 }
@@ -848,9 +1295,9 @@ load_split_ckpt <- function(path) {
 
 # ── 14. Main Experiment Loop ──────────────────────────────────────────────────
 cat(sprintf("\n=== ME-HAS Survival Benchmark (%d datasets) ===\n", length(DATASET_REGISTRY)))
-cat("Models: CoxPH / GBM / XGBoost / WeibullAFT\n")
-cat("Baselines: Complete/MeanSI/KNN/RFI/MissInd/MIE_PMM_AVG/MIE_CART_AVG/MICE_SE\n")
-cat("Metrics: Harrell C-index (primary)  |  Uno's C-statistic (secondary, IPCW)\n")
+cat(sprintf("Models: %s\n", paste(SURV_NAMES, collapse=" / ")))
+cat("Baselines: Complete(paired)/MeanSI/KNN/RFI/MissInd/MIE_PMM_AVG/MIE_CART_AVG/MICE_SE\n")
+cat("Metrics: Harrell C-index | Brier(tau) | IBS(0..tau)\n")
 cat(sprintf("Splits: %d | M_IMP: %d | MAXIT_MICE: %d\n", N_SPLITS, M_IMP, MAXIT_MICE))
 cat("Checkpoints: split-level (dataset × mech × rate × split)\n\n")
 
@@ -862,15 +1309,17 @@ all_time_rows       <- list()
 all_mehas_time_rows <- list()
 pipeline_t0         <- proc.time()
 
-RESULT_COLS <- c("Method","Classifier","Cindex","Uno_C",
+RESULT_COLS <- c("Method","Classifier","Cindex", CALIB_METRICS,
                  "Dataset","MissMech","MissRate","Split","ActualMiss")
 FB_COLS     <- c("MissMech","MissRate",
                  "fb_knn","fb_rfi","fb_missind","fb_mice_na","fb_mice_cart",
-                 "fb_mice_se_imp","fb_mice_se_l0","fb_me_has")
+                 "fb_mice_se_imp","fb_mice_se_l0","fb_me_has","fb_me_has_mm")
 
 pad_df <- function(df, required_cols) {
   for (col in setdiff(required_cols, names(df))) df[[col]] <- NA_real_
-  df
+  # Extra (purane version ke) columns bhi hata do aur order fix karo --
+  # taa ke har data.frame ke columns bilkul same hon aur rbind kabhi fail na ho
+  df[, required_cols, drop=FALSE]
 }
 harmonise_ckpt <- function(ckpt) {
   ckpt$results <- lapply(ckpt$results, pad_df, required_cols=RESULT_COLS)
@@ -879,7 +1328,7 @@ harmonise_ckpt <- function(ckpt) {
 }
 
 for (ds in DATASET_REGISTRY) {
-
+  
   # ── Check dataset-level summary ckpt (fast path) ──────────────────────────
   ds_ckpt <- ds_ckpt_file(ds$name)
   if (file.exists(ds_ckpt)) {
@@ -890,18 +1339,32 @@ for (ds in DATASET_REGISTRY) {
       missing_mechs   <- setdiff(MISS_MECHS, mechs_in_ckpt)
       has_brier       <- any(unlist(lapply(ckpt_raw$results,
                                            function(df) "Brier" %in% names(df))))
-      has_uno_c       <- any(unlist(lapply(ckpt_raw$results,
-                                           function(df) "Uno_C" %in% names(df))))
+      has_ibs         <- any(unlist(lapply(ckpt_raw$results,
+                                           function(df) "IBS" %in% names(df))))
       methods_in_ckpt <- unique(unlist(lapply(ckpt_raw$results, function(df)
         if (!is.null(df$Method)) unique(df$Method) else character(0))))
-      stale_methods   <- length(setdiff(METHOD_ORDER, methods_in_ckpt)) > 0 ||
-        length(setdiff(methods_in_ckpt, c(METHOD_ORDER,"Complete"))) > 0
+      stale_methods   <- length(setdiff(METHOD_ORDER_ALL, methods_in_ckpt)) > 0 ||
+        length(setdiff(methods_in_ckpt, METHOD_ORDER_ALL)) > 0
       clfs_in_ckpt    <- unique(unlist(lapply(ckpt_raw$results, function(df)
         if (!is.null(df$Classifier)) unique(df$Classifier) else character(0))))
       stale_clfs      <- length(setdiff(SURV_NAMES, clfs_in_ckpt)) > 0 ||
         length(setdiff(clfs_in_ckpt, c(SURV_NAMES,"All"))) > 0
-      ds_stale <- length(missing_mechs)>0 || has_brier || !has_uno_c ||
-        stale_methods || stale_clfs
+      # FIX: ds-ckpt mein SAARE (mech x rate) cells aur har cell mein N_SPLITS
+      # splits hone chahiye -- warna pilot / adhoora run poore run ki jagah load
+      # ho jata (misal 2 splits wala pilot 10-split run mein skip ho jata).
+      ck_all <- tryCatch(do.call(rbind, lapply(ckpt_raw$results, function(df)
+        df[, intersect(c("MissMech","MissRate","Split","Method"), names(df)), drop=FALSE])),
+        error=function(e) NULL)
+      grid_incomplete <- TRUE
+      if (!is.null(ck_all) && all(c("MissMech","MissRate","Split") %in% names(ck_all))) {
+        ck_all <- ck_all[ck_all$Method == "ME_HAS", , drop=FALSE]
+        grid_incomplete <- any(sapply(MISS_MECHS, function(mm) any(sapply(MISS_RATES, function(mr) {
+          sp <- unique(ck_all$Split[ck_all$MissMech == mm & abs(as.numeric(ck_all$MissRate) - mr) < 1e-6])
+          !all(seq_len(N_SPLITS) %in% sp)
+        }))))
+      }
+      ds_stale <- length(missing_mechs)>0 || !has_ibs ||
+        stale_methods || stale_clfs || grid_incomplete
       if (!ds_stale) {
         ckpt         <- harmonise_ckpt(ckpt_raw)
         all_results  <- c(all_results,  ckpt$results)
@@ -914,8 +1377,8 @@ for (ds in DATASET_REGISTRY) {
       # Stale ds-ckpt: delete it but keep any valid split ckpts below
       reason <- paste(c(
         if (length(missing_mechs)>0) paste("missing mech:", paste(missing_mechs,collapse=",")),
-        if (has_brier)     "Brier checkpoint",
-        if (!has_uno_c)    "missing Uno_C",
+        if (!has_ibs)      "missing IBS",
+        if (grid_incomplete) "rates/splits incomplete",
         if (stale_methods) "method list changed",
         if (stale_clfs)    sprintf("clf list changed (%s)", paste(clfs_in_ckpt,collapse=","))
       ), collapse="; ")
@@ -923,7 +1386,7 @@ for (ds in DATASET_REGISTRY) {
       file.remove(ds_ckpt)
     }
   }
-
+  
   # ── Load dataset ──────────────────────────────────────────────────────────
   cat(sprintf(">>> Processing: %s\n", ds$name))
   DATASET <- tryCatch(ds$loader(), error=function(e) {
@@ -946,56 +1409,13 @@ for (ds in DATASET_REGISTRY) {
               nrow(DATASET), length(PRED_NAMES), n_events,
               100*n_events/nrow(DATASET), EPV,
               if (EPV < 10) " [!EPV<10]" else ""))
-
+  
   ds_results <- list(); ds_var_rows <- list()
   ds_fb_rows <- list(); ds_miss_log <- list()
   ds_t0      <- proc.time()
-
-  # ── Complete-case baseline (split-level ckpts) ────────────────────────────
-  n_complete_loaded <- 0L
-  for (sp in seq_len(N_SPLITS)) {
-    cc_ckpt <- complete_ckpt_file(ds$name, sp)
-    cc_data <- load_split_ckpt(cc_ckpt)
-    if (!is.null(cc_data)) {
-      # Already done — load from split ckpt
-      ds_results <- c(ds_results, list(cc_data$rows))
-      n_complete_loaded <- n_complete_loaded + 1L
-      next
-    }
-    # Run complete-case for this split
-    base_seed <- make_split_seed(sp, ds$name, miss_rate=0, mech="NONE")
-    set.seed(base_seed)
-    tr_idx0 <- caret::createDataPartition(DATASET$event, p=TRAIN_FRAC, list=FALSE)[, 1]
-    te_idx0 <- setdiff(seq_len(nrow(DATASET)), tr_idx0)
-    X_tr0   <- DATASET[tr_idx0, PRED_NAMES, drop=FALSE]
-    ttr0    <- DATASET[tr_idx0, "time"];  etr0 <- DATASET[tr_idx0, "event"]
-    X_te0   <- DATASET[te_idx0, PRED_NAMES, drop=FALSE]
-    tte0    <- DATASET[te_idx0, "time"];  ete0 <- DATASET[te_idx0, "event"]
-    sp_t0_cc <- proc.time()
-    b_rows <- list()
-    for (mech0 in MISS_MECHS) {
-      b <- do.call(rbind, lapply(SURV_NAMES, function(sn) {
-        risk <- safe_fit_surv(sn, X_tr0, ttr0, etr0, X_te0)
-        mt   <- compute_surv_metrics(risk, tte0, ete0)
-        data.frame(Method="Complete", Classifier=sn, t(mt), stringsAsFactors=FALSE)
-      }))
-      b$Dataset    <- ds$name; b$MissMech  <- mech0
-      b$MissRate   <- 0;       b$Split     <- sp
-      b$ActualMiss <- 0
-      b_rows[[length(b_rows)+1]] <- b
-    }
-    cc_rows       <- do.call(rbind, b_rows)
-    sp_elapsed_cc <- (proc.time() - sp_t0_cc)[["elapsed"]]
-    # Save split ckpt for complete case
-    save_split_ckpt(cc_ckpt, rows=cc_rows,
-                    var_rows=NULL, fb_row=NULL,
-                    miss_log_row=NULL,
-                    mehas_elapsed=0, elapsed_sec=sp_elapsed_cc)
-    ds_results <- c(ds_results, list(cc_rows))
-  }
-  if (n_complete_loaded > 0)
-    cat(sprintf("  [complete-case: %d/%d splits from ckpt]\n",
-                n_complete_loaded, N_SPLITS))
+  
+  # (Purana alag complete-case loop hata diya: Complete ab run_one_surv() ke
+  #  andar har missing cell ke SAME split par chalta hai -- paired reference.)
 
   # ── Missing-data experiments (split-level ckpts) ──────────────────────────
   for (mech in MISS_MECHS) {
@@ -1003,11 +1423,11 @@ for (ds in DATASET_REGISTRY) {
     for (miss_rate in MISS_RATES) {
       cat(sprintf(" %g%%", miss_rate*100))
       n_loaded_this_rate <- 0L
-
+      
       for (sp in seq_len(N_SPLITS)) {
         sp_ckpt <- split_ckpt_file(ds$name, mech, miss_rate, sp)
         sp_data <- load_split_ckpt(sp_ckpt)
-
+        
         if (!is.null(sp_data)) {
           # ── Load from split checkpoint ──
           ds_results <- c(ds_results, list(sp_data$rows))
@@ -1033,35 +1453,42 @@ for (ds in DATASET_REGISTRY) {
           cat("~")   # ~ means loaded from ckpt
           next
         }
-
+        
         # ── Run this split ──
-        sp_seed <- make_split_seed(sp, ds$name, miss_rate, mech)
-        set.seed(sp_seed)
+        # Split: har rate/mechanism par SAME (sirf split + dataset par depend)
+        set.seed(make_partition_seed(sp, ds$name))
         tr_idx  <- caret::createDataPartition(DATASET$event, p=TRAIN_FRAC, list=FALSE)[, 1]
         te_idx  <- setdiff(seq_len(nrow(DATASET)), tr_idx)
         X_tr    <- DATASET[tr_idx, PRED_NAMES, drop=FALSE]
         time_tr <- DATASET[tr_idx, "time"]; evt_tr <- DATASET[tr_idx, "event"]
         X_te    <- DATASET[te_idx, PRED_NAMES, drop=FALSE]
         time_te <- DATASET[te_idx, "time"]; evt_te <- DATASET[te_idx, "event"]
-
-        X_tr_miss_check <- tryCatch(
+        
+        # Missingness mask: EK hi dafa, cell-specific seed se -- yahi mask
+        # run_one_surv() ko jata hai
+        sp_seed <- make_split_seed(sp, ds$name, miss_rate, mech)
+        set.seed(sp_seed)
+        X_tr_miss_cell <- tryCatch(
           induce_missing(X_tr, miss_rate, mech,
                          time_vec=time_tr, event_vec=evt_tr),
           error=function(e) X_tr)
-        actual_miss_pct <- round(mean(is.na(X_tr_miss_check)) * 100, 2)
+        actual_miss_pct <- round(mean(is.na(X_tr_miss_cell)) * 100, 2)
         if (sp == 1) cat(sprintf("[actual=%.1f%%]", actual_miss_pct))
-
+        
         miss_log_row <- data.frame(
           Dataset=ds$name, MissMech=mech, NominalRate=miss_rate,
           NominalPct=miss_rate*100, ActualMiss=actual_miss_pct/100,
           ActualPct=actual_miss_pct, Split=sp, stringsAsFactors=FALSE)
         ds_miss_log <- c(ds_miss_log, list(miss_log_row))
-
+        
         split_t0 <- proc.time()
+        .META_ENV$cell <- sprintf("%s|%s|%.0f%%|sp%02d", ds$name, mech, miss_rate*100, sp)
         out <- tryCatch(
           run_one_surv(mech, miss_rate, sp_seed,
                        X_tr, time_tr, evt_tr,
-                       X_te, time_te, evt_te),
+                       X_te, time_te, evt_te,
+                       X_tr_miss = X_tr_miss_cell,
+                       complete_seed = make_complete_seed(sp, ds$name)),
           error=function(e) {
             message(sprintf("\n  [ERR %s %s %.0f%% sp=%d] %s",
                             ds$name, mech, miss_rate*100, sp,
@@ -1069,21 +1496,21 @@ for (ds in DATASET_REGISTRY) {
             NULL
           })
         split_elapsed <- (proc.time() - split_t0)[["elapsed"]]
-
+        
         if (!is.null(out)) {
           res            <- out$rows
           res$Dataset    <- ds$name; res$MissMech  <- mech
           res$MissRate   <- miss_rate; res$Split    <- sp
           res$ActualMiss <- actual_miss_pct/100
-
+          
           vr <- out$var_rows
           if (!is.null(vr) && nrow(vr) > 0) {
             vr$Dataset <- ds$name; vr$Split <- sp
           }
-
+          
           fbr         <- out$fb_row
           fbr$Dataset <- ds$name; fbr$Split <- sp
-
+          
           # ── Save split-level checkpoint immediately ──
           save_split_ckpt(
             sp_ckpt,
@@ -1093,21 +1520,21 @@ for (ds in DATASET_REGISTRY) {
             miss_log_row = miss_log_row,
             mehas_elapsed = out$mehas_elapsed,
             elapsed_sec   = split_elapsed)
-
+          
           ds_results  <- c(ds_results,  list(res))
           if (!is.null(vr) && nrow(vr) > 0)
             ds_var_rows <- c(ds_var_rows, list(vr))
           ds_fb_rows  <- c(ds_fb_rows,   list(fbr))
-
+          
           all_time_rows[[length(all_time_rows)+1]] <- data.frame(
             Dataset=ds$name, MissMech=mech, MissRate=miss_rate,
             Split=sp, elapsed_sec=round(split_elapsed,3),
             from_ckpt=FALSE, stringsAsFactors=FALSE)
-
+          
           all_mehas_time_rows[[length(all_mehas_time_rows)+1]] <- data.frame(
             Dataset=ds$name, MissMech=mech, MissRate=miss_rate, Split=sp,
             n_train=length(time_tr),
-            long_format_rows=length(time_tr)*length(SURV_NAMES)*M_IMP,
+            long_format_rows=length(time_tr)*length(SURV_NAMES)*M_IMP,   # main ME-HAS: learners x PMM draws
             mehas_elapsed_sec=round(out$mehas_elapsed, 4),
             fallback=isTRUE(fbr$fb_me_has),
             stringsAsFactors=FALSE)
@@ -1120,18 +1547,18 @@ for (ds in DATASET_REGISTRY) {
     }
     cat("done\n")
   }
-
+  
   ds_elapsed <- (proc.time() - ds_t0)[["elapsed"]]
   cat(sprintf("  [Dataset total: %.1f sec / %.1f min]\n",
               ds_elapsed, ds_elapsed/60))
-
+  
   # ── Save dataset-level summary ckpt (for fast reload next time) ──────────
   saveRDS(list(results  = ds_results,
                var_rows = ds_var_rows,
                fb_rows  = ds_fb_rows,
                miss_log = ds_miss_log), ds_ckpt)
   cat(sprintf("  [DS-CKPT saved: %s]\n", basename(ds_ckpt)))
-
+  
   all_results  <- c(all_results,  ds_results)
   all_var_rows <- c(all_var_rows, ds_var_rows)
   all_fb_rows  <- c(all_fb_rows,  ds_fb_rows)
@@ -1147,7 +1574,9 @@ if (length(all_time_rows) > 0) {
   time_df   <- do.call(rbind, all_time_rows); rownames(time_df) <- NULL
   total_row <- data.frame(Dataset="__TOTAL_PIPELINE__", MissMech=NA_character_,
                           MissRate=NA_real_, Split=NA_integer_,
-                          elapsed_sec=round(pipeline_elapsed,3), stringsAsFactors=FALSE)
+                          elapsed_sec=round(pipeline_elapsed,3),
+                          from_ckpt=NA,   # time_df jaisa hi 6th column, warna rbind fail
+                          stringsAsFactors=FALSE)
   write.csv(rbind(time_df, total_row),
             file.path(OUTPUT_DIR,"Multi_HAS_Survival_compute_time.csv"), row.names=FALSE)
   cat("Saved: Multi_HAS_Survival_compute_time.csv\n")
@@ -1177,7 +1606,19 @@ safe_rbind <- function(lst, required_cols=NULL) {
 combined          <- safe_rbind(all_results, RESULT_COLS)
 combined$MissRate <- as.numeric(combined$MissRate)
 combined$MissMech <- factor(combined$MissMech, levels=MISS_MECHS)
-combined$Method   <- factor(combined$Method,   levels=METHOD_ORDER)
+# Reporting labels (dekhein MAIN_HAS_VARIANT): MM variant main "ME_HAS" ban jata hai
+if (MAIN_HAS_VARIANT == "MM") {
+  meth_chr <- as.character(combined$Method)
+  stopifnot(any(meth_chr == "ME_HAS_MM"))
+  meth_chr[meth_chr == "ME_HAS"]    <- "ME_HAS_PMM"
+  meth_chr[meth_chr == "ME_HAS_MM"] <- "ME_HAS"
+  combined$Method <- meth_chr
+  cat("\n>>> REPORTING: ME_HAS = proposed ME-HAS (4 MICE methods: pmm, cart, norm, rf);",
+      "ME_HAS_PMM = PMM-only reference. Saari tables, rank tables, Kendall's W aur figures",
+      "isi labelling se bante hain (paper ke mutabiq).\n")
+}
+combined$Method   <- factor(combined$Method,   levels=REPORT_LEVELS)
+stopifnot(!any(is.na(combined$Method)))
 write.csv(combined, file.path(OUTPUT_DIR,"Multi_HAS_Survival_results.csv"), row.names=FALSE)
 cat("Saved: Multi_HAS_Survival_results.csv\n")
 
@@ -1195,9 +1636,9 @@ if (length(all_fb_rows) > 0) {
   cat("║       FALLBACK AUDIT                        ║\n")
   cat("╠══════════════════════════════════════════════╣\n")
   fb_cols   <- c("fb_knn","fb_rfi","fb_missind","fb_mice_na","fb_mice_cart",
-                 "fb_mice_se_imp","fb_mice_se_l0","fb_me_has")
+                 "fb_mice_se_imp","fb_mice_se_l0","fb_me_has","fb_me_has_mm")
   fb_labels <- c("KNN→MeanSI","RFI→MeanSI","MissInd→MeanSI","MICE+NA→stdMICE",
-                 "CART→PMM","MICE_SE_imp→reuse","MICE_SE_L0→avg","ME_HAS→avg")
+                 "CART→PMM","MICE_SE_imp→reuse","MICE_SE_L0→avg","ME_HAS→avg","ME_HAS_MM→avg")
   total_runs <- nrow(fb_combined); all_clean <- TRUE
   for (i in seq_along(fb_cols)) {
     n_fb <- sum(fb_combined[[fb_cols[i]]], na.rm=TRUE)
@@ -1233,8 +1674,9 @@ per_ds_summ <- combined %>%
     n_splits    = dplyr::n(),
     Cindex_mean = round(mean(Cindex, na.rm=TRUE), 4),
     Cindex_sd   = round(sd(Cindex,   na.rm=TRUE), 4),
-    Uno_C_mean  = round(mean(Uno_C,  na.rm=TRUE), 4),
-    Uno_C_sd    = round(sd(Uno_C,    na.rm=TRUE), 4),
+    dplyr::across(dplyr::all_of(CALIB_METRICS),
+                  list(mean=~round(mean(.x, na.rm=TRUE), 4),
+                       sd  =~round(sd(.x,   na.rm=TRUE), 4))),
     .groups="drop")
 write.csv(per_ds_summ,
           file.path(OUTPUT_DIR,"Multi_HAS_Survival_per_dataset_summary.csv"), row.names=FALSE)
@@ -1245,109 +1687,21 @@ grand_summ <- combined %>%
     n_obs       = dplyr::n(),
     Cindex_mean = round(mean(Cindex, na.rm=TRUE), 4),
     Cindex_sd   = round(sd(Cindex,   na.rm=TRUE), 4),
-    Uno_C_mean  = round(mean(Uno_C,  na.rm=TRUE), 4),
-    Uno_C_sd    = round(sd(Uno_C,    na.rm=TRUE), 4),
+    dplyr::across(dplyr::all_of(CALIB_METRICS),
+                  list(mean=~round(mean(.x, na.rm=TRUE), 4),
+                       sd  =~round(sd(.x,   na.rm=TRUE), 4))),
     .groups="drop")
 write.csv(grand_summ,
           file.path(OUTPUT_DIR,"Multi_HAS_Survival_grand_summary.csv"), row.names=FALSE)
 cat("Saved: summaries\n")
 
-# ── 17. Wilcoxon Signed-Rank Tests ────────────────────────────────────────────
-# Bonferroni correction over N_BONF_TOTAL = 280 simultaneous tests.
-# Family: 28 competitor method–classifier combinations × 2 metrics × 5 rates,
-# computed separately per missing-data mechanism (MAR and MCAR).
-
-IMPUTE_METHODS <- c("MeanSI","KNN","RFI","MissInd","MIE_PMM_AVG","MIE_CART_AVG","MICE_SE")
-
-ds_level <- combined %>%
-  dplyr::group_by(Dataset, MissMech, MissRate, Method, Classifier) %>%
-  dplyr::summarise(Cindex_ds=mean(Cindex, na.rm=TRUE),
-                   Uno_C_ds =mean(Uno_C,  na.rm=TRUE), .groups="drop")
-
-RANK_METHODS <- c("MeanSI","KNN","RFI","MissInd","MIE_PMM_AVG","MIE_CART_AVG","MICE_SE","ME_HAS")
-wilcox_rows  <- list()
-
-champ_ds <- ds_level %>%
-  dplyr::filter(Method=="ME_HAS", Classifier=="All") %>%
-  dplyr::select(Dataset, MissMech, MissRate,
-                Cindex_ch=Cindex_ds, Uno_C_ch=Uno_C_ds)
-
-comp_combos <- ds_level %>%
-  dplyr::filter(Method %in% IMPUTE_METHODS) %>%
-  dplyr::distinct(Method, Classifier) %>%
-  dplyr::mutate(Method=factor(Method, levels=METHOD_ORDER)) %>%
-  dplyr::arrange(Method, Classifier)
-
-# Bonferroni correction applied per mechanism separately
-# (MAR and MCAR reported in separate tables → separate family of tests)
-# Per mechanism: 28 combos × 2 metrics × 5 rates = 280
-n_combos        <- nrow(comp_combos)
-n_metrics       <- 2L
-n_rates         <- length(MISS_RATES)
-N_BONF_PER_MECH <- n_combos * n_metrics * n_rates
-cat(sprintf("Bonferroni: %d combos × %d metrics × %d rates = %d per mechanism\n",
-            n_combos, n_metrics, n_rates, N_BONF_PER_MECH))
-
-for (ci in seq_len(n_combos)) {
-  meth <- as.character(comp_combos$Method[ci])
-  clf  <- as.character(comp_combos$Classifier[ci])
-  comp_ds <- ds_level %>%
-    dplyr::filter(Method==meth, Classifier==clf) %>%
-    dplyr::select(Dataset, MissMech, MissRate,
-                  Cindex_comp=Cindex_ds, Uno_C_comp=Uno_C_ds)
-  if (nrow(comp_ds) == 0) next
-  paired_all <- dplyr::inner_join(champ_ds, comp_ds,
-                                  by=c("Dataset","MissMech","MissRate"))
-  for (mech in MISS_MECHS)
-    for (mr in MISS_RATES) {
-      paired <- paired_all %>%
-        dplyr::filter(MissMech==mech, abs(MissRate-mr)<1e-6)
-      if (nrow(paired) < 2) next
-      for (metric in c("Cindex","Uno_C")) {
-        champ_col <- if (metric=="Cindex") paired$Cindex_ch else paired$Uno_C_ch
-        comp_col  <- if (metric=="Cindex") paired$Cindex_comp else paired$Uno_C_comp
-        diff_vec  <- champ_col - comp_col
-        n <- sum(!is.na(diff_vec)); if (n < 2) next
-        wt <- tryCatch(wilcox.test(champ_col, comp_col, paired=TRUE, exact=FALSE),
-                       error=function(e) NULL)
-        if (is.null(wt)) next
-        # Bonferroni: correct within each mechanism separately
-        p_adj  <- round(min(wt$p.value * N_BONF_PER_MECH, 1), 5)
-        n_wins <- sum(diff_vec > 0, na.rm=TRUE)
-        n_loss <- sum(diff_vec < 0, na.rm=TRUE)
-        r_rbc  <- round((n_wins - n_loss) / n, 3)
-        wilcox_rows[[length(wilcox_rows)+1]] <- data.frame(
-          Champion   = "ME_HAS",
-          Metric     = metric,
-          MissMech   = mech,
-          MissRate   = mr,
-          MissRate_pct = paste0(round(mr*100), "%"),
-          Competitor = meth,
-          Classifier = clf,
-          n_pairs    = n,
-          W          = round(wt$statistic, 1),
-          p_value    = round(wt$p.value, 5),
-          p_adj_Bonf = p_adj,
-          Signif     = dplyr::case_when(
-            p_adj<0.001 ~ "***", p_adj<0.01 ~ "**",
-            p_adj<0.05  ~ "*",   TRUE        ~ "ns"),
-          r_rank_biserial = r_rbc,
-          ES_interp  = dplyr::case_when(
-            abs(r_rbc)>=0.3 ~ "large",
-            abs(r_rbc)>=0.1 ~ "medium", TRUE ~ "small"),
-          mean_diff       = round(mean(diff_vec, na.rm=TRUE), 4),
-          sd_diff         = round(sd(diff_vec,   na.rm=TRUE), 4),
-          Champion_wins   = n_wins,
-          Ties            = sum(diff_vec==0, na.rm=TRUE),
-          Champion_losses = n_loss,
-          stringsAsFactors=FALSE)
-      }
-    }
-}
-wilcox_df <- do.call(rbind, wilcox_rows); rownames(wilcox_df) <- NULL
-write.csv(wilcox_df,
-          file.path(OUTPUT_DIR,"Multi_HAS_Survival_wilcoxon.csv"), row.names=FALSE)
-cat("Saved: Multi_HAS_Survival_wilcoxon.csv\n")
+# ── 17. Method lists for rank tables ─────────────────────────────────────────
+# (Wilcoxon / Bonferroni tests hata diye gaye -- paper mein sirf grand-mean
+#  tables aur Kendall's W rank tables report hote hain.)
+# Kendall rank tables mein yeh methods (har classifier ke saath) + ME_HAS.
+# Complete reference hai, ranking mein shamil nahi.
+RANK_METHODS <- c("MeanSI","KNN","RFI","MissInd","MIE_PMM_AVG","MIE_CART_AVG",
+                  "MICE_SE","ME_HAS")
 
 # ── 18. LaTeX Helpers ─────────────────────────────────────────────────────────
 `%.%` <- function(a,b) paste0(a,b)
@@ -1356,6 +1710,9 @@ method_tex <- function(meth)
   switch(as.character(meth),
          ME_HAS       = "\\textbf{ME-HAS (proposed)}",
          MICE_SE      = "MICE-SE (Stacking)",
+         ME_HAS_MM    = "ME-HAS (4 MICE methods)",
+         ME_HAS_PMM   = "ME-HAS (PMM only)",
+         MICE_SE_MM   = "MICE-SE (4 MICE methods)",
          MIE_PMM_AVG  = "MIE-PMM-Avg",
          MIE_CART_AVG = "MIE-CART-Avg",
          MeanSI       = "Mean SI",
@@ -1398,7 +1755,7 @@ pivot_wide_ms <- function(df, metric) {
 }
 
 build_latex_table <- function(wide, metric, caption_str, label_str,
-                              target_mech="MAR") {
+                              target_mech="MAR", method_levels=METHOD_ORDER) {
   mech_keys <- paste0(target_mech,
                       sprintf("%02d", as.integer(MISS_RATES*100)))
   present   <- intersect(c("COMP", mech_keys), names(wide))
@@ -1406,12 +1763,15 @@ build_latex_table <- function(wide, metric, caption_str, label_str,
   nm2 <- sum(mech_keys %in% present)
   nd  <- nc + nm2
   wide <- wide %>%
-    dplyr::mutate(Method=factor(Method, levels=METHOD_ORDER)) %>%
+    dplyr::filter(as.character(Method) %in% method_levels) %>%
+    dplyr::mutate(Method=factor(Method, levels=method_levels)) %>%
     dplyr::arrange(Method, Classifier)
+  hib <- if (metric %in% names(METRIC_HIB)) METRIC_HIB[[metric]] else TRUE
   best_row <- sapply(present, function(k) {
     vals <- unlist(wide[[k]])
     if (all(is.na(vals))) return(NA_integer_)
-    which(vals==max(vals, na.rm=TRUE))[1]
+    best <- if (hib) max(vals, na.rm=TRUE) else min(vals, na.rm=TRUE)
+    which(vals==best)[1]
   })
   lines <- c("\\begin{table}[!ht]", "  \\centering",
              sprintf("  \\caption{%s}", caption_str),
@@ -1457,171 +1817,191 @@ make_grand_table <- function(gs, metric="Cindex", target_mech="MAR") {
   gs_m <- gs %>%
     dplyr::filter(abs(MissRate)<1e-6 | MissMech==target_mech)
   mech_desc <- if (target_mech=="MAR")
-    "MAR mechanism: logistic model, $\\beta=\\log(9)$, OR$\\approx$9 per SD \\citep{WhiteRoyston2009}."
+    "MAR-type mechanism: logistic model on the row mean of the other standardised covariates, $\\log T$ and $\\Delta$, $\\beta=\\log(9)$ (OR$\\approx$9 per unit of this score)."
   else
     "MCAR mechanism: columns masked completely at random."
-  metric_desc <- if (metric=="Cindex")
-    "Harrell C-index (concordance; higher is better) \\citep{Harrell1996}"
-  else
-    paste0("Uno's C-statistic (IPCW-weighted concordance; higher is better) \\citep{Uno2011}.",
-           " Evaluated via \\texttt{pec::cindex()} at $\\tau_{0.75}$",
-           " (75th percentile of observed event times).")
+  metric_desc <- switch(metric,
+    Cindex = "Harrell C-index (concordance; higher is better; \\texttt{survival::concordance}) \\citep{Harrell1996}.",
+    Brier  = paste0("Brier score at $\\tau_{0.75}$ (75th percentile of test event times; lower is better;",
+                    " IPCW, \\texttt{riskRegression::Score}) \\citep{Graf1999,Gerds2006}.",
+                    " Risk scores mapped to probabilities by 5-fold cross-fitted Cox recalibration on the test set."),
+    IBS    = paste0("Integrated Brier score over $[0,\\tau_{0.75}]$ (lower is better;",
+                    " IPCW, \\texttt{riskRegression::Score}) \\citep{Graf1999,Gerds2006}.",
+                    " Risk scores mapped to probabilities by 5-fold cross-fitted Cox recalibration on the test set."))
+  imp_desc <- if (MAIN_HAS_VARIANT == "MM")
+    paste0("MIE-PMM-Avg and MICE-SE: MICE-PMM ($m=5$); MIE-CART-Avg: MICE-CART ($m=5$);",
+           " ME-HAS: four MICE methods (pmm, cart, norm, rf; $m=5$ each, averaged within method).")
+  else "MIE-PMM-Avg, MICE-SE and ME-HAS: MICE-PMM ($m=5$); MIE-CART-Avg: MICE-CART ($m=5$)."
   cap <- sprintf(
     paste0("Grand mean %s ($\\text{mean}\\pm\\text{SD}$) averaged over %d",
            " right-censored survival benchmark datasets and %d stratified",
-           " train--test splits (70/30). \\textit{Complete}: no missingness",
-           " imposed. \\textit{ME-HAS} (proposed): Mixed-Effects Hierarchical",
+           " train--test splits (70/30). \\textit{Complete}: fully observed data on the",
+           " same train--test split as each missingness cell (paired reference).",
+           " \\textit{ME-HAS} (proposed): Mixed-Effects Hierarchical",
            " Aware Stacking. \\textit{Missing Indicator} (MissInd): binary",
            " missingness flags appended to mean-imputed data",
            " \\citep{Jones1996,Sperrin2020}. %s",
-           " MICE uses PMM with Nelson--Aalen predictor",
+           " %s All MICE models include the Nelson--Aalen cumulative hazard and the event indicator",
            " \\citep{WhiteRoyston2009,vanBuurenGroothuis2011}."),
-    metric_desc, length(DATASET_REGISTRY), N_SPLITS, mech_desc)
+    metric_desc, length(DATASET_REGISTRY), N_SPLITS, mech_desc, imp_desc)
   build_latex_table(
     pivot_wide_ms(gs_m, metric), metric, cap,
     sprintf("tab:grand_%s_%s", tolower(metric), tolower(target_mech)),
     target_mech=target_mech)
 }
 
-make_kendall_rank_table <- function(metric="Cindex", target_mech="MAR",
-                                    target_rate=0.30) {
-  score_col   <- if (metric=="Cindex") "Cindex_ds" else "Uno_C_ds"
-  imp_methods <- setdiff(RANK_METHODS, "ME_HAS")
-  imp_sub <- ds_level %>%
-    dplyr::filter(MissMech==target_mech,
-                  abs(MissRate-target_rate)<1e-6,
-                  Method %in% imp_methods,
-                  Classifier %in% SURV_NAMES) %>%
-    dplyr::mutate(RowKey=paste0(Method,"___",Classifier)) %>%
-    dplyr::select(Dataset, RowKey, val=dplyr::all_of(score_col))
-  has_sub <- ds_level %>%
-    dplyr::filter(MissMech==target_mech,
-                  abs(MissRate-target_rate)<1e-6,
-                  Method=="ME_HAS", Classifier=="All") %>%
-    dplyr::mutate(RowKey="ME_HAS___All") %>%
-    dplyr::select(Dataset, RowKey, val=dplyr::all_of(score_col))
-  sub <- dplyr::bind_rows(imp_sub, has_sub)
-  if (nrow(sub) < 2) return("")
-  wide <- sub %>% tidyr::pivot_wider(names_from=Dataset, values_from=val)
-  row_order <- c(unlist(lapply(imp_methods,
-                               function(m) paste0(m,"___",SURV_NAMES))),
-                 "ME_HAS___All")
-  row_order <- row_order[row_order %in% wide$RowKey]
-  wide      <- wide[match(row_order, wide$RowKey), ]
-  datasets  <- setdiff(names(wide), "RowKey")
-  score_mat <- wide %>%
-    dplyr::select(dplyr::all_of(datasets)) %>% as.matrix()
-  rownames(score_mat) <- wide$RowKey
-  rank_mat <- apply(score_mat, 2, function(x) {
-    if (sum(!is.na(x)) < 2) return(rep(NA_real_, length(x)))
-    rank(-x, ties.method="average", na.last="keep")
-  })
-  rownames(rank_mat) <- wide$RowKey
-  valid_cols <- colSums(!is.na(rank_mat)) >= 2
-  valid_rows <- rowSums(!is.na(rank_mat[, valid_cols, drop=FALSE])) >= 2
-  rm_clean   <- rank_mat[valid_rows, valid_cols, drop=FALSE]
-  n_obj <- nrow(rm_clean); m_judges <- ncol(rm_clean)
-  W_val <- chi_val <- p_val <- df_val <- NA_real_; signif_str <- ""
-  if (n_obj >= 2 && m_judges >= 2) {
-    rs      <- rowSums(rm_clean, na.rm=TRUE)
-    mean_rs <- m_judges*(n_obj+1)/2
-    S       <- sum((rs-mean_rs)^2)
-    W_val   <- 12*S / (m_judges^2*(n_obj^3-n_obj))
-    chi_val <- m_judges*(n_obj-1)*W_val
-    df_val  <- n_obj-1
-    p_val   <- pchisq(chi_val, df=df_val, lower.tail=FALSE)
-    signif_str <- dplyr::case_when(p_val<0.001~"***", p_val<0.01~"**",
-                                   p_val<0.05~"*",    TRUE~"ns")
+# ── Kendall's W rank tables (binary pipeline jaisa) ─────────────────────────
+# Har dataset ek "judge" (rater) hai jo saare method/classifier combinations ko
+# rank karta hai (rank 1 = best). Kendall's W (tie-corrected, irr::kendall)
+# batata hai ke datasets ranking par kitna agree karte hain (0 = koi agreement
+# nahi, 1 = poora). chi2 = m (n-1) W, df = n-1 (Kendall & Babington Smith 1939).
+compute_kendall_W <- function(rank_mat) {
+  # Kendall's W seedha R package se: irr::kendall(ratings, correct = TRUE)
+  #   ratings = objects (rows: method/classifier) x raters (columns: datasets)
+  #   correct = TRUE -> ties ke liye correction (Wt)
+  #   irr::kendall har column ko khud rank() karta hai; hamare ranks (1 = best)
+  #   par rank() wahi order deta hai, isliye nateeja same hai.
+  #   Note: irr::kendall na.omit() karta hai -- jis row mein kisi dataset ka NA
+  #   ho woh hat jati hai (n_objects output mein dikhta hai).
+  if (nrow(rank_mat) < 2 || ncol(rank_mat) < 2)
+    return(list(W = NA_real_, chi2 = NA_real_, df = NA_integer_,
+                p_value = NA_real_, n_objects = nrow(rank_mat)))
+  kw <- irr::kendall(rank_mat, correct = TRUE)
+  list(W         = round(unname(kw$value), 4),
+       chi2      = round(unname(kw$statistic), 3),
+       df        = as.integer(kw$subjects - 1L),
+       p_value   = signif(unname(kw$p.value), 4),
+       n_objects = kw$subjects)
+}
+
+build_rank_table <- function(data_in, miss_rate_val, metric = "Cindex",
+                             higher_is_better = TRUE, mech = "MAR") {
+  sub <- data_in %>%
+    dplyr::filter(Method != "Complete",            # Complete reference hai, competitor nahi
+                  Method %in% RANK_METHODS,
+                  abs(MissRate - miss_rate_val) < 1e-6)
+  if (nrow(sub) == 0) {
+    message(sprintf("[Kendall] No %s data at %g%%", mech, miss_rate_val * 100))
+    return(NULL)
   }
-  mean_rank_per_row    <- rowMeans(rank_mat, na.rm=TRUE)
-  valid_keys_unsorted  <- row_order[row_order %in% names(mean_rank_per_row)]
-  row_order <- valid_keys_unsorted[order(mean_rank_per_row[valid_keys_unsorted])]
-  row_label_tex <- function(key) {
-    parts <- strsplit(key, "___")[[1]]; meth <- parts[1]; clf <- parts[2]
-    m_lab <- switch(meth,
-                    MeanSI       = "Mean SI",
-                    KNN          = "KNN (SI)",
-                    RFI          = "RFI (SI)",
-                    MissInd      = "Missing Indicator",
-                    MIE_PMM_AVG  = "MIE-PMM-Avg",
-                    MIE_CART_AVG = "MIE-CART-Avg",
-                    MICE_SE      = "MICE-SE",
-                    ME_HAS       = "\\textbf{ME-HAS (proposed)}",
-                    meth)
-    if (clf=="All") m_lab else sprintf("%s --- %s", m_lab, clf)
+  # Har dataset ke liye split-average value
+  agg <- sub %>%
+    dplyr::group_by(Method, Classifier, Dataset) %>%
+    dplyr::summarise(metric_mean = mean(.data[[metric]], na.rm = TRUE), .groups = "drop") %>%
+    dplyr::mutate(MethodClf = paste(Method, Classifier, sep = "/"))
+  row_order <- c(unlist(lapply(setdiff(RANK_METHODS, ALL_CLF_METHODS),
+                               function(m) paste(m, SURV_NAMES, sep = "/"))),
+                 paste(ALL_CLF_METHODS, "All", sep = "/"))
+  row_order <- row_order[row_order %in% unique(agg$MethodClf)]
+
+  wide_val <- agg %>%
+    dplyr::select(MethodClf, Dataset, metric_mean) %>%
+    tidyr::pivot_wider(names_from = Dataset, values_from = metric_mean) %>%
+    dplyr::mutate(MethodClf = factor(MethodClf, levels = row_order)) %>%
+    dplyr::arrange(MethodClf)
+  ds_cols <- setdiff(names(wide_val), "MethodClf")
+
+  # Har dataset mein rank (1 = best). C-index: zyada behtar; Brier/IBS: kam behtar.
+  sign_flip <- if (higher_is_better) -1 else 1
+  rank_wide <- wide_val
+  for (dc in ds_cols)
+    rank_wide[[dc]] <- rank(sign_flip * wide_val[[dc]],
+                            ties.method = "average", na.last = "keep")
+  rank_mat <- as.matrix(rank_wide[, ds_cols, drop = FALSE])
+  rownames(rank_mat) <- as.character(rank_wide$MethodClf)
+  rank_wide$MeanRank    <- round(rowMeans(rank_mat, na.rm = TRUE), 2)
+  rank_wide$OverallRank <- rank(rank_wide$MeanRank, ties.method = "average")
+  rank_wide <- rank_wide[order(rank_wide$OverallRank), ]
+  rank_mat  <- as.matrix(rank_wide[, ds_cols, drop = FALSE])
+  rownames(rank_mat) <- as.character(rank_wide$MethodClf)
+
+  list(miss_rate = miss_rate_val, metric = metric, mech = mech,
+       val_wide = wide_val, rank_wide = rank_wide, rank_mat = rank_mat,
+       datasets = ds_cols, kendall = compute_kendall_W(rank_mat))
+}
+
+rank_table_to_latex <- function(rt) {
+  mr_pct  <- as.integer(round(rt$miss_rate * 100))
+  met     <- rt$metric
+  rw      <- rt$rank_wide
+  ds_cols <- rt$datasets
+  kw      <- rt$kendall
+  n_ds    <- length(ds_cols)
+  n_cols  <- n_ds + 2L
+  p_txt   <- ifelse(is.na(kw$p_value), "\\text{NA}",
+                    ifelse(kw$p_value < 0.001, "<0.001", sprintf("%.4f", kw$p_value)))
+  cap <- sprintf(paste0(
+    "Dataset-level rankings of method--model combinations (\\textbf{%s}, %s; %d\\%% %s). ",
+    "Rank~1 denotes the best combination on each dataset; rows are sorted by mean rank ",
+    "across %d right-censored survival datasets. Concordance of rankings across datasets: ",
+    "Kendall's $W = %.4f$, $\\chi^2(%d) = %.3f$, $p = %s$."),
+    METRIC_LABEL[[met]], if (METRIC_HIB[[met]]) "higher is better" else "lower is better",
+    mr_pct, rt$mech, n_ds,
+    ifelse(is.na(kw$W), NA, kw$W), kw$df, ifelse(is.na(kw$chi2), NA, kw$chi2), p_txt)
+  hdr <- paste(c(sprintf("\\textbf{\\rotatebox{45}{%s}}", gsub("_", " ", ds_cols)),
+                 "\\textbf{Mean Rank}", "\\textbf{Overall Rank}"), collapse = " & ")
+  lines <- c("\\begin{table}[!ht]", "  \\centering",
+             sprintf("  \\caption{%s}", cap),
+             sprintf("  \\label{tab:rank_%s_%s%02d}", tolower(met), rt$mech, mr_pct),
+             "  \\resizebox{\\linewidth}{!}{%",
+             sprintf("  \\begin{tabular}{@{}l%s@{}}", strrep("c", n_cols)),
+             "  \\toprule",
+             sprintf("  \\textbf{Method/Model} & %s \\\\", hdr),
+             "  \\midrule")
+  fmt_r <- function(v) if (is.na(v)) "--" else if (v == floor(v)) as.character(as.integer(v)) else sprintf("%.1f", v)
+  for (i in seq_len(nrow(rw))) {
+    parts <- strsplit(as.character(rw$MethodClf[i]), "/")[[1]]
+    ds_cells <- sapply(ds_cols, function(dc) {
+      rv <- rw[[dc]][i]; s <- fmt_r(rv)
+      if (!is.na(rv) && rv <= 1.5) sprintf("\\textbf{%s}", s) else s
+    })
+    mr_fmt <- sprintf("%.2f", rw$MeanRank[i])
+    if (!is.na(rw$MeanRank[i]) && rw$MeanRank[i] == min(rw$MeanRank, na.rm = TRUE))
+      mr_fmt <- sprintf("\\textbf{%s}", mr_fmt)
+    or_fmt <- fmt_r(rw$OverallRank[i])
+    if (!is.na(rw$OverallRank[i]) && rw$OverallRank[i] <= 1.5)
+      or_fmt <- sprintf("\\textbf{%s}", or_fmt)
+    row_label <- sprintf("%s/%s", method_tex(parts[1]), parts[2])
+    lines <- c(lines, sprintf("  %s & %s \\\\", row_label,
+                              paste(c(ds_cells, mr_fmt, or_fmt), collapse = " & ")))
   }
-  fmt_note <- if (metric=="Cindex") "higher C-index $=$ better"
-  else                   "higher Uno's C $=$ better"
-  ds_hdrs <- sapply(datasets,
-                    function(d) sprintf("\\textbf{\\rotatebox{45}{%s}}", d))
-  col_hdr <- c("\\textbf{Method}", ds_hdrs, "\\textbf{Mean}")
-  ncols   <- length(col_hdr)
-  lines <- c(
-    "\\begin{table}[!ht]", "  \\centering",
-    sprintf(paste0(
-      "  \\caption{Ranks of all method--classifier combinations across",
-      " %d datasets (\\emph{%s}, %s, %.0f\\%% %s; %s),",
-      " sorted by mean rank (ascending): top row = overall best.",
-      " Rank~1~=~best per dataset; \\textbf{bold}~=~column-best.",
-      " \\textbf{Mean}: average rank (lower is better).",
-      " Kendall's $W$ (footer) measures rank consistency.",
-      " $^{***}p<0.001$, $^{**}p<0.01$, $^{*}p<0.05$, ns~=~not significant.}"),
-      length(datasets), metric, target_mech,
-      target_rate*100, target_mech, fmt_note),
-    sprintf("  \\label{tab:rank_%s_%s_%02d}",
-            tolower(metric), tolower(target_mech),
-            as.integer(target_rate*100)),
-    "  \\resizebox{\\linewidth}{!}{%",
-    sprintf("  \\begin{tabular}{@{}l%s@{}}", strrep("c", ncols-1)),
-    "  \\toprule",
-    paste(col_hdr, collapse=" & ") %.% " \\\\",
-    "  \\midrule")
-  valid_keys   <- row_order[row_order %in% rownames(rank_mat)]
-  best_per_col <- apply(rank_mat[valid_keys, datasets, drop=FALSE], 2,
-                        function(x) suppressWarnings(min(x, na.rm=TRUE)))
-  best_mean    <- suppressWarnings(min(mean_rank_per_row[valid_keys], na.rm=TRUE))
-  for (key in row_order) {
-    if (!key %in% rownames(rank_mat)) next
-    row_vals <- rank_mat[key, datasets]
-    mean_val <- mean_rank_per_row[key]
-    cells <- mapply(function(v, col_best) {
-      if (is.na(v)||!is.finite(v)) return("--")
-      s <- sprintf("%.1f", v)
-      if (is.finite(col_best) && abs(v-col_best)<1e-8)
-        paste0("\\textbf{", s, "}") else s
-    }, row_vals, best_per_col[datasets], SIMPLIFY=TRUE)
-    mean_cell <- if (is.finite(mean_val)) {
-      s <- sprintf("%.2f", mean_val)
-      if (is.finite(best_mean) && abs(mean_val-best_mean)<1e-8)
-        paste0("\\textbf{", s, "}") else s
-    } else "--"
-    lines <- c(lines,
-               paste(c(row_label_tex(key), cells, mean_cell),
-                     collapse=" & ") %.% " \\\\")
-  }
-  lines <- c(lines, "  \\midrule")
-  w_str   <- if (!is.na(W_val))   sprintf("%.4f", W_val)           else "--"
-  chi_str <- if (!is.na(chi_val)) sprintf("%.3f", chi_val)         else "--"
-  p_str   <- if (!is.na(p_val))   sprintf("%.5f", p_val)           else "--"
-  df_str  <- if (!is.na(df_val))  as.character(as.integer(df_val)) else "?"
-  w_content <- sprintf(
-    "$W = %s$,\\ $\\chi^2_{%s} = %s$,\\ $p = %s$\\ %s",
-    w_str, df_str, chi_str, p_str, signif_str)
-  lines <- c(lines,
-             sprintf("  Kendall's $W$ & \\multicolumn{%d}{c}{%s} \\\\",
-                     length(datasets)+1L, w_content),
-             "  \\bottomrule", "  \\end{tabular}%",
-             "  }", "\\end{table}", "")
-  paste(lines, collapse="\n")
+  lines <- c(lines, "  \\bottomrule",
+             sprintf("  \\multicolumn{%d}{l}{\\footnotesize Kendall's $W = %.4f$; $\\chi^2 = %.3f$; $df = %d$; $p = %s$} \\\\",
+                     n_cols + 1L, ifelse(is.na(kw$W), 0, kw$W),
+                     ifelse(is.na(kw$chi2), 0, kw$chi2), kw$df, p_txt),
+             "  \\end{tabular}%", "  }", "\\end{table}", "")
+  paste(lines, collapse = "\n")
+}
+
+# ME-HAS coxme diagnostics (har session ki part files + purani single file)
+load_mehas_diag <- function() {
+  parts <- list.files(OUTPUT_DIR, pattern="^Multi_HAS_Survival_mehas_diagnostics_part_.*\\.csv$",
+                      full.names=TRUE)
+  old_f <- file.path(OUTPUT_DIR, "Multi_HAS_Survival_mehas_diagnostics.csv")
+  if (file.exists(old_f)) parts <- c(old_f, parts)
+  if (length(parts) == 0) return(NULL)
+  md <- dplyr::bind_rows(lapply(parts, function(f)
+    tryCatch(read.csv(f, stringsAsFactors=FALSE), error=function(e) NULL)))
+  if (nrow(md) == 0) return(NULL)
+  if (!"Variant" %in% names(md)) md$Variant <- "PMM"
+  md <- md[sub("\\|.*", "", md$Cell) %in% sapply(DATASET_REGISTRY, `[[`, "name"), , drop=FALSE]
+  md[!duplicated(paste(md$Cell, md$Variant), fromLast=TRUE), , drop=FALSE]
 }
 
 make_varcomp_table <- function(target_mech="MAR") {
-  if (is.null(var_combined)||nrow(var_combined)==0) return("")
-  vc <- var_combined %>%
-    dplyr::filter(Classifier=="ME_HAS", MissMech==target_mech) %>%
+  # Variance components MAIN ME-HAS variant ke coxme fits se (diagnostics file).
+  md <- load_mehas_diag()
+  if (is.null(md)) return("")
+  md <- md[md$Variant == MAIN_HAS_VARIANT, , drop=FALSE]
+  cell_parts <- strsplit(md$Cell, "|", fixed=TRUE)
+  md$Dataset  <- sapply(cell_parts, `[`, 1)
+  md$MissMech <- sapply(cell_parts, `[`, 2)
+  md$MissRate <- as.numeric(sub("%", "", sapply(cell_parts, `[`, 3))) / 100
+  vc <- md %>%
+    dplyr::filter(MissMech==target_mech) %>%
     dplyr::group_by(Dataset, MissRate) %>%
-    dplyr::summarise(slope_mean =mean(var_slope_clf,    na.rm=TRUE),
-                     interc_mean=mean(var_intercept_imp, na.rm=TRUE),
+    dplyr::summarise(slope_mean =mean(var_slope_clf,        na.rm=TRUE),
+                     interc_mean=mean(var_intercept_method, na.rm=TRUE),
                      .groups="drop")
   if (nrow(vc)==0) return("")
   mr_pcts  <- sort(unique(vc$MissRate))
@@ -1643,10 +2023,11 @@ make_varcomp_table <- function(target_mech="MAR") {
       " ($\\mathrm{lp}\\mid\\texttt{clf\\_id}$; between-classifier",
       " heterogeneity); \\emph{bottom} =",
       " $\\hat{\\sigma}^2_{\\mathrm{intercept}}$",
-      " ($1\\mid\\texttt{imp\\_id}$; between-imputation baseline risk,",
-      " analogous to Rubin's $B$ \\citep{Rubin1987}).",
+      " ($1\\mid\\texttt{method\\_id}$; %s).",
       " Extracted via \\texttt{coxme::VarCorr} \\citep{Therneau2012}.}"),
-      N_SPLITS, target_mech),
+      N_SPLITS, target_mech,
+      if (MAIN_HAS_VARIANT == "MM") "between-imputation-method shift: pmm, cart, norm, rf"
+      else "between-PMM-draw shift"),
     sprintf("  \\label{tab:varcomp_%s}", tolower(target_mech)),
     "  \\renewcommand{\\arraystretch}{1.4}",
     "  \\resizebox{\\linewidth}{!}{%",
@@ -1698,34 +2079,105 @@ for (mech in MISS_MECHS) {
   grand_tex <- file.path(OUTPUT_DIR,
                          sprintf("Multi_HAS_Survival_grand_tables_%s.tex", mech))
   gt_lines  <- latex_preamble(10)
-  for (met in c("Cindex","Uno_C"))
+  for (met in EVAL_METRICS)
     gt_lines <- c(gt_lines, make_grand_table(grand_summ, met, target_mech=mech))
   gt_lines <- c(gt_lines, "\\end{document}")
   writeLines(gt_lines, grand_tex)
   cat(sprintf("Saved: %s\n", basename(grand_tex)))
-
+  
   vc_tex   <- file.path(OUTPUT_DIR,
                         sprintf("Multi_HAS_Survival_varcomp_table_%s.tex", mech))
   vc_lines <- c(latex_preamble(10), make_varcomp_table(mech), "\\end{document}")
   writeLines(vc_lines, vc_tex)
   cat(sprintf("Saved: %s\n", basename(vc_tex)))
+  
+}
 
-  for (met in c("Cindex","Uno_C")) {
-    rank_tex <- file.path(OUTPUT_DIR,
-                          sprintf("Multi_HAS_Survival_rank_tables_%s_%s.tex", mech, met))
-    rk_lines <- c(latex_preamble(9),
-                  sprintf("%% Rank Tables — %s, %s\n", mech, met))
-    for (mr in MISS_RATES) {
-      tbl <- make_kendall_rank_table(met, mech, mr)
-      if (nchar(tbl)>0) {
-        rk_lines <- c(rk_lines, tbl)
-        cat(sprintf("  rank table: %s %s %.0f%%\n", met, mech, mr*100))
-      }
-    }
-    rk_lines <- c(rk_lines, "\\end{document}")
-    writeLines(rk_lines, rank_tex)
-    cat(sprintf("Saved: %s\n", basename(rank_tex)))
+# ── SUPPLEMENTARY: PMM vs 4-method stacking (MICE_SE, ME-HAS) ───────────────
+# Same splits, same masks; sirf stacking ki imputation alag (PMM vs pmm/cart/norm/rf).
+if (RUN_MULTIMETHOD) {
+  # Reporting labels (MAIN_HAS_VARIANT = "MM"): ME_HAS = 4-method, ME_HAS_PMM = PMM-only
+  if (MAIN_HAS_VARIANT == "MM") {
+    SUPP_TABLE_METHODS <- c("MICE_SE", "MICE_SE_MM", "ME_HAS_PMM", "ME_HAS")
+    MM_LABELS          <- c("MICE_SE_MM", "ME_HAS")
+  } else {
+    SUPP_TABLE_METHODS <- c("MICE_SE", "MICE_SE_MM", "ME_HAS", "ME_HAS_MM")
+    MM_LABELS          <- c("MICE_SE_MM", "ME_HAS_MM")
   }
+  supp_csv <- grand_summ %>%
+    dplyr::filter(as.character(Method) %in% SUPP_TABLE_METHODS) %>%
+    dplyr::mutate(Imputation = ifelse(as.character(Method) %in% MM_LABELS,
+                                      "MICE: pmm+cart+norm+rf (4 x 5)", "MICE-PMM (m=5)"))
+  write.csv(supp_csv, file.path(OUTPUT_DIR, "Multi_HAS_Survival_supp_multimethod.csv"),
+            row.names=FALSE)
+  for (mech in MISS_MECHS) {
+    supp_lines <- latex_preamble(10)
+    for (met in EVAL_METRICS) {
+      gs_m <- grand_summ %>%
+        dplyr::filter(MissMech == mech, as.character(Method) %in% SUPP_TABLE_METHODS)
+      cap <- sprintf(paste0(
+        "Supplementary: stacking with MICE-PMM ($m=5$) versus four MICE",
+        " imputation methods (pmm, cart, norm, rf; 5 draws each) -- %s, %s.",
+        " Main analysis: MICE-SE with MICE-PMM, ME-HAS with four methods.",
+        " Same train--test splits and missingness masks as the main analysis;",
+        " for each variant, MICE-SE and ME-HAS use identical level-0 predictions."),
+        METRIC_LABEL[[met]], mech)
+      supp_lines <- c(supp_lines, build_latex_table(
+        pivot_wide_ms(gs_m, met), met, cap,
+        sprintf("tab:supp_mm_%s_%s", tolower(met), tolower(mech)),
+        target_mech = mech, method_levels = SUPP_TABLE_METHODS))
+    }
+    supp_lines <- c(supp_lines, "\\end{document}")
+    writeLines(supp_lines, file.path(OUTPUT_DIR,
+               sprintf("Multi_HAS_Survival_supp_multimethod_%s.tex", mech)))
+    cat(sprintf("Saved: Multi_HAS_Survival_supp_multimethod_%s.tex\n", mech))
+  }
+}
+
+# ── Kendall's W rank tables: har mechanism x metric x missingness rate ───────
+cat("\n=== Kendall's W Rank Tables (C-index, Brier, IBS) ===\n")
+rank_table_list      <- list()
+kendall_summary_rows <- list()
+for (mech in MISS_MECHS) {
+  mech_data <- combined %>% dplyr::filter(MissMech == mech)
+  for (met in EVAL_METRICS) {
+    hib <- METRIC_HIB[[met]]
+    tex_lines <- c(latex_preamble(9),
+                   sprintf("%% Kendall's W Rank Tables -- %s, %s, one per missingness level", mech, met), "")
+    for (mr in MISS_RATES) {
+      mr_pct <- as.integer(round(mr * 100))
+      rt <- build_rank_table(mech_data, mr, metric = met,
+                             higher_is_better = hib, mech = mech)
+      if (is.null(rt)) next
+      rank_table_list[[paste0(mech, "_", met, "_", mr_pct)]] <- rt
+      kw <- rt$kendall
+      cat(sprintf("%s | %-6s | %2d%%: W = %.4f, chi2(%d) = %.3f, p = %s\n",
+                  mech, met, mr_pct, ifelse(is.na(kw$W), NaN, kw$W), kw$df,
+                  ifelse(is.na(kw$chi2), NaN, kw$chi2),
+                  ifelse(is.na(kw$p_value), "NA",
+                         ifelse(kw$p_value < 0.001, "< 0.001", sprintf("%.4f", kw$p_value)))))
+      kendall_summary_rows[[length(kendall_summary_rows) + 1]] <- data.frame(
+        Metric = met, MissMech = mech, MissRate = mr, MissRate_pct = mr_pct,
+        W = kw$W, chi2 = kw$chi2, df = kw$df, p_value = kw$p_value,
+        n_methods = kw$n_objects, n_datasets = ncol(rt$rank_mat),
+        stringsAsFactors = FALSE)
+      csv_rt <- rt$rank_wide
+      csv_rt$MissRate_pct <- mr_pct; csv_rt$Metric <- met; csv_rt$MissMech <- mech
+      write.csv(csv_rt, file.path(OUTPUT_DIR,
+                sprintf("Multi_HAS_Survival_rank_table_%s_%02dpct_%s.csv", mech, mr_pct, met)),
+                row.names = FALSE)
+      tex_lines <- c(tex_lines, rank_table_to_latex(rt))
+    }
+    tex_lines <- c(tex_lines, "\\end{document}")
+    writeLines(tex_lines, file.path(OUTPUT_DIR,
+               sprintf("Multi_HAS_Survival_rank_tables_%s_%s.tex", mech, met)))
+  }
+}
+if (length(kendall_summary_rows) > 0) {
+  kendall_df <- do.call(rbind, kendall_summary_rows); rownames(kendall_df) <- NULL
+  write.csv(kendall_df, file.path(OUTPUT_DIR, "Multi_HAS_Survival_kendall_W_summary.csv"),
+            row.names = FALSE)
+  cat("Saved: Multi_HAS_Survival_kendall_W_summary.csv\n")
 }
 
 # ── 19. Figures ───────────────────────────────────────────────────────────────
@@ -1752,7 +2204,7 @@ ltype_pal <- c(
   MICE_SE      = "twodash",
   ME_HAS       = "solid"
 )
-surv_shape_pal <- setNames(c(16L, 17L, 15L, 18L), SURV_NAMES)
+surv_shape_pal <- setNames(c(16L, 17L, 15L, 18L, 8L, 4L)[seq_along(SURV_NAMES)], SURV_NAMES)
 METHOD_LABELS  <- c(
   Complete     = "Complete",
   MeanSI       = "Mean (SI)",
@@ -1779,28 +2231,28 @@ theme_paper <- function(base=9)
 
 for (mech in MISS_MECHS) {
   cat(sprintf("\n=== Figures for %s ===\n", mech))
-
+  
   clf_raw <- combined %>%
     dplyr::filter(Method %in% METHOD_ORDER, MissMech==mech) %>%
     dplyr::group_by(MissRate, Method, Classifier) %>%
     dplyr::summarise(Mean_Cindex = mean(Cindex, na.rm=TRUE),
                      SD_Cindex   = sd(Cindex,   na.rm=TRUE),
-                     Mean_Uno_C  = mean(Uno_C,  na.rm=TRUE),
-                     SD_Uno_C    = sd(Uno_C,    na.rm=TRUE),
+                     Mean_Brier  = mean(Brier,  na.rm=TRUE),
+                     Mean_IBS    = mean(IBS,    na.rm=TRUE),
                      .groups="drop")
-
-  mehas_raw <- clf_raw %>% dplyr::filter(Method=="ME_HAS", Classifier=="All")
+  
+  mehas_raw <- clf_raw %>% dplyr::filter(Method %in% ALL_CLF_METHODS, Classifier=="All")
   mehas_rep <- purrr::map_dfr(SURV_NAMES, ~dplyr::mutate(mehas_raw, Classifier=.x))
-
+  
   plot_clf <- dplyr::bind_rows(
-    clf_raw %>% dplyr::filter(Method!="ME_HAS"),
+    clf_raw %>% dplyr::filter(!Method %in% ALL_CLF_METHODS),
     mehas_rep) %>%
     dplyr::mutate(
       Method      = factor(Method, levels=METHOD_ORDER),
       MethodLabel = factor(dplyr::recode(as.character(Method), !!!METHOD_LABELS),
                            levels=unname(METHOD_LABELS)),
       ClfLabel    = factor(Classifier, levels=SURV_NAMES))
-
+  
   make_traj_plot <- function(y_var, y_lab, fig_title, caption_txt) {
     ggplot(plot_clf %>% dplyr::filter(!is.na(MethodLabel), !is.na(ClfLabel)),
            aes(x=MissRate*100, y=.data[[y_var]],
@@ -1831,7 +2283,7 @@ for (mech in MISS_MECHS) {
              linetype = guide_legend(nrow=3),
              shape    = guide_legend(nrow=1))
   }
-
+  
   # Fig A: Grand mean C-index
   pA <- make_traj_plot(
     "Mean_Cindex",
@@ -1844,38 +2296,42 @@ for (mech in MISS_MECHS) {
   ggsave(file.path(OUTPUT_DIR, sprintf("figA_grand_cindex_%s.pdf", mech)),
          plot=pA, width=16, height=5, units="in", device=cairo_pdf)
   cat(sprintf("Saved: figA_grand_cindex_%s (.png + .pdf)\n", mech))
-
-  # Fig A2: Grand mean Uno's C
-  pA2 <- make_traj_plot(
-    "Mean_Uno_C",
-    "Mean Uno's C-statistic (IPCW)",
-    sprintf("Grand Mean Uno's C-statistic Trajectories Under %s", mech),
-    sprintf("Grand mean over %d benchmark datasets. IPCW-weighted, tau=Q75 event times.",
-            length(unique(combined$Dataset))))
-  ggsave(file.path(OUTPUT_DIR, sprintf("figA2_grand_uno_c_%s.png", mech)),
-         plot=pA2, width=16, height=5, units="in", dpi=900, bg="white")
-  ggsave(file.path(OUTPUT_DIR, sprintf("figA2_grand_uno_c_%s.pdf", mech)),
-         plot=pA2, width=16, height=5, units="in", device=cairo_pdf)
-  cat(sprintf("Saved: figA2_grand_uno_c_%s (.png + .pdf)\n", mech))
-
+  
+  # Fig A2/A3: Grand mean Brier aur IBS (kam = behtar)
+  for (fm in list(list(col="Mean_Brier", lab="Mean Brier score at tau (lower is better)",
+                       tag="figA2_grand_brier", ttl="Brier Score"),
+                  list(col="Mean_IBS",   lab="Mean integrated Brier score (lower is better)",
+                       tag="figA3_grand_ibs",   ttl="Integrated Brier Score"))) {
+    pX <- make_traj_plot(
+      fm$col, fm$lab,
+      sprintf("Grand Mean %s Trajectories Under %s", fm$ttl, mech),
+      sprintf("Grand mean over %d benchmark datasets. tau = 75th percentile of test event times; IPCW (riskRegression::Score).",
+              length(unique(combined$Dataset))))
+    ggsave(file.path(OUTPUT_DIR, sprintf("%s_%s.png", fm$tag, mech)),
+           plot=pX, width=16, height=5, units="in", dpi=900, bg="white")
+    ggsave(file.path(OUTPUT_DIR, sprintf("%s_%s.pdf", fm$tag, mech)),
+           plot=pX, width=16, height=5, units="in", device=cairo_pdf)
+    cat(sprintf("Saved: %s_%s (.png + .pdf)\n", fm$tag, mech))
+  }
+  
   # Fig B: Per-dataset C-index
   clf_ds_raw <- combined %>%
     dplyr::filter(Method %in% METHOD_ORDER, MissMech==mech) %>%
     dplyr::group_by(MissRate, Method, Classifier, Dataset) %>%
     dplyr::summarise(Mean_Cindex=mean(Cindex, na.rm=TRUE), .groups="drop")
   mehas_ds_raw <- clf_ds_raw %>%
-    dplyr::filter(Method=="ME_HAS", Classifier=="All")
+    dplyr::filter(Method %in% ALL_CLF_METHODS, Classifier=="All")
   mehas_ds_rep <- purrr::map_dfr(SURV_NAMES,
                                  ~dplyr::mutate(mehas_ds_raw, Classifier=.x))
   plot_clf_ds <- dplyr::bind_rows(
-    clf_ds_raw %>% dplyr::filter(Method!="ME_HAS"),
+    clf_ds_raw %>% dplyr::filter(!Method %in% ALL_CLF_METHODS),
     mehas_ds_rep) %>%
     dplyr::mutate(
       Method      = factor(Method, levels=METHOD_ORDER),
       MethodLabel = factor(dplyr::recode(as.character(Method), !!!METHOD_LABELS),
                            levels=unname(METHOD_LABELS)),
       ClfLabel    = factor(Classifier, levels=SURV_NAMES))
-
+  
   pB <- ggplot(
     plot_clf_ds %>% dplyr::filter(!is.na(MethodLabel), !is.na(ClfLabel)),
     aes(x=MissRate*100, y=Mean_Cindex,
@@ -1916,13 +2372,14 @@ for (mech in MISS_MECHS) {
 }
 
 # ── 20. Console Quick Checks ──────────────────────────────────────────────────
-cat("\n=== METHOD-AVERAGED C-index & Uno's C @ 50% missingness ===\n")
+cat("\n=== METHOD-AVERAGED C-index / Brier / IBS @ 50% missingness ===\n")
 cat("(ME_HAS: All classifiers; others: averaged across classifiers)\n")
 grand_summ %>%
-  dplyr::filter(abs(MissRate-0.50)<1e-6 | MissRate==0) %>%
+  dplyr::filter(abs(MissRate-0.50)<1e-6, as.character(Method) %in% METHOD_ORDER) %>%
   dplyr::group_by(MissMech, Method) %>%
-  dplyr::summarise(Cindex_mean = mean(Cindex_mean, na.rm=TRUE),
-                   Uno_C_mean  = mean(Uno_C_mean,  na.rm=TRUE),
+  dplyr::summarise(Cindex_mean = round(mean(Cindex_mean, na.rm=TRUE), 4),
+                   Brier_mean  = round(mean(Brier_mean,  na.rm=TRUE), 4),
+                   IBS_mean    = round(mean(IBS_mean,    na.rm=TRUE), 4),
                    .groups="drop") %>%
   dplyr::mutate(Method=factor(Method, levels=METHOD_ORDER)) %>%
   dplyr::arrange(MissMech, dplyr::desc(Cindex_mean)) %>%
@@ -1930,18 +2387,72 @@ grand_summ %>%
 
 cat("\n=== PER-CLASSIFIER breakdown @ 50% missingness ===\n")
 grand_summ %>%
-  dplyr::filter(abs(MissRate-0.50)<1e-6 | MissRate==0) %>%
+  dplyr::filter(abs(MissRate-0.50)<1e-6, as.character(Method) %in% METHOD_ORDER) %>%
   dplyr::mutate(Method=factor(Method, levels=METHOD_ORDER)) %>%
   dplyr::arrange(MissMech, Method, Classifier) %>%
-  dplyr::select(MissMech, Method, Classifier, Cindex_mean, Uno_C_mean) %>%
+  dplyr::select(MissMech, Method, Classifier, Cindex_mean, Brier_mean, IBS_mean) %>%
   as.data.frame() %>% print(row.names=FALSE)
+
+# ── 20b. ME-HAS (coxme) diagnostics summary ─────────────────────────────────
+# Har variant (PMM = main, MM = supplementary) ke liye alag: kitne fits full
+# model ke saath hue, kitne fallback par gaye, aur singular / near-boundary rates.
+diag_parts <- list.files(OUTPUT_DIR, pattern="^Multi_HAS_Survival_mehas_diagnostics_part_.*\\.csv$",
+                         full.names=TRUE)
+# Purane runs ki single diagnostics file bhi shamil karo (backward compatible)
+old_diag <- file.path(OUTPUT_DIR, "Multi_HAS_Survival_mehas_diagnostics.csv")
+if (file.exists(old_diag)) diag_parts <- c(old_diag, diag_parts)
+if (length(diag_parts) > 0) {
+  md <- dplyr::bind_rows(lapply(diag_parts, function(f)
+    tryCatch(read.csv(f, stringsAsFactors=FALSE), error=function(e) NULL)))
+  # Sirf is run ke datasets/mechanisms ke cells rakho
+  md <- md[sub("\\|.*", "", md$Cell) %in% sapply(DATASET_REGISTRY, `[[`, "name"), , drop=FALSE]
+  if (!"Variant" %in% names(md)) md$Variant <- "PMM"
+  md <- md[!duplicated(paste(md$Cell, md$Variant), fromLast=TRUE), ]
+  write.csv(md, file.path(OUTPUT_DIR, "Multi_HAS_Survival_mehas_diagnostics_dedup.csv"),
+            row.names=FALSE)
+  for (vv in unique(md$Variant)) {
+    m2  <- md[md$Variant == vv, , drop=FALSE]
+    pct <- function(x) sprintf("%d/%d (%.1f%%)", sum(x, na.rm=TRUE), nrow(m2),
+                               100*mean(x, na.rm=TRUE))
+    cat(sprintf("\n=== ME-HAS coxme diagnostics [%s] ===\n",
+                paste0(if (vv == MAIN_HAS_VARIANT) "MAIN: " else "SUPP: ",
+                       if (vv == "PMM") "PMM only" else "4 MICE methods")))
+    cat(sprintf("Total fits                 : %d\n", nrow(m2)))
+    cat(sprintf("Full model                 : %s\n", pct(m2$full_model %in% TRUE)))
+    cat(sprintf("Fallback simple mean       : %s\n", pct(grepl("^NONE", m2$formula))))
+    if ("singular_clf" %in% names(m2)) {
+      cat("Singular = SD < 1e-4 (lme4::isSingular jaisa); near = SD < 0.01\n")
+      cat(sprintf("Classifier slope   singular / near: %s / %s\n",
+                  pct(m2$singular_clf %in% TRUE), pct(m2$near_clf %in% TRUE)))
+      cat(sprintf("%-18s singular / near: %s / %s\n",
+                  if (vv == "PMM") "Draw intercept" else "Method intercept",
+                  pct(m2$singular_method %in% TRUE), pct(m2$near_method %in% TRUE)))
+    }
+  }
+}
+
+# ── 20c. Learner failure report ─────────────────────────────────────────────
+lrn <- union(names(.FIT_LOG$n), names(.FIT_LOG$fb))
+if (length(lrn) > 0) {
+  lf <- data.frame(Learner = lrn,
+                   n_errors    = sapply(lrn, function(l) if (is.null(.FIT_LOG$n[[l]])) 0 else .FIT_LOG$n[[l]]),
+                   n_fallbacks = sapply(lrn, function(l) if (is.null(.FIT_LOG$fb[[l]])) 0 else .FIT_LOG$fb[[l]]),
+                   example_error = sapply(lrn, function(l) paste(unique(.FIT_LOG$msg[[l]]), collapse=" || ")),
+                   stringsAsFactors = FALSE, row.names = NULL)
+  write.csv(lf, file.path(OUTPUT_DIR, sprintf("Multi_HAS_Survival_learner_failures_%s.csv", SESSION_TAG)),
+            row.names=FALSE)
+  cat("\n=== Learner failures (is run mein; checkpoint se load hue cells shamil nahi) ===\n")
+  print(lf[, c("Learner","n_errors","n_fallbacks")], row.names=FALSE)
+} else cat("\n=== Learner failures: koi nahi ===\n")
 
 # ── 21. Final Summary ─────────────────────────────────────────────────────────
 cat("\n=============================================\n")
 cat("  ALL DONE — ME-HAS Survival Benchmark\n")
 cat("=============================================\n")
-cat("Methods: Complete/MeanSI/KNN/RFI/MissInd/MIE_PMM_AVG/MIE_CART_AVG/MICE_SE/ME_HAS\n")
-cat("Metrics: Harrell C-index (primary) | Uno's C via pec::cindex() (secondary)\n")
-cat(sprintf("Bonferroni N = %d per mechanism (28 combos × 2 metrics × 5 rates)\n",
-            N_BONF_PER_MECH))
+cat("Methods: Complete(paired)/MeanSI/KNN/RFI/MissInd/MIE_PMM_AVG/MIE_CART_AVG/MICE_SE/ME_HAS\n")
+cat(sprintf("Main ME-HAS variant: %s | MICE_SE (main): PMM only\n",
+            if (MAIN_HAS_VARIANT == "MM") "4 MICE methods (pmm+cart+norm+rf)" else "PMM only"))
+cat("Metrics: Harrell C (survival::concordance) | Brier(tau), IBS(0..tau) via riskRegression::Score\n")
+cat("Kendall's W: irr::kendall(correct=TRUE) on per-dataset ranks for C-index, Brier, IBS\n")
+cat("Tables: grand mean (C-index, Brier, IBS) + Kendall's W rank tables\n")
 cat(sprintf("\nOutput: %s/\n", OUTPUT_DIR))
